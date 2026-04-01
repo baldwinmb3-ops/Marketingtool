@@ -39,6 +39,22 @@ const {
 const SESSION_COOKIE = 'mt_session';
 const DEFAULT_SESSION_TTL_MS = 1000 * 60 * 60 * 12;
 
+function extractSessionIdFromRequest(req) {
+  const cookieSession = String((req.cookies && req.cookies[SESSION_COOKIE]) || '').trim();
+  if (cookieSession) return cookieSession;
+
+  const authHeader = String((req.headers && req.headers.authorization) || '').trim();
+  if (/^Bearer\s+/i.test(authHeader)) {
+    const bearer = authHeader.replace(/^Bearer\s+/i, '').trim();
+    if (bearer) return bearer;
+  }
+
+  const headerSession = String((req.headers && req.headers['x-session-id']) || '').trim();
+  if (headerSession) return headerSession;
+
+  return '';
+}
+
 function parseCookieSameSite(value) {
   const raw = String(value || '').trim().toLowerCase();
   if (raw === 'none') return 'none';
@@ -123,7 +139,7 @@ async function createApp(options = {}) {
   }
 
   async function authContext(req) {
-    const sessionId = String((req.cookies && req.cookies[SESSION_COOKIE]) || '').trim();
+    const sessionId = extractSessionIdFromRequest(req);
     const session = await getSession(sessionId);
     if (!session) return { session: null, user: null, payload: buildSessionPayload(null, null) };
     const user = session.user;
@@ -238,7 +254,7 @@ async function createApp(options = {}) {
         });
       });
       const payload = buildSessionPayload(signIn.user, { activeRole: signIn.activeRole, createdAt: nowIso() });
-      res.json({ ok: true, message: signIn.body.message, session: payload });
+      res.json({ ok: true, message: signIn.body.message, session: payload, session_id: sessionId, session_transport: 'cookie_or_bearer' });
     } catch (error) {
       next(error);
     }
@@ -252,12 +268,16 @@ async function createApp(options = {}) {
     res.json({ ok: true, session: req.auth.payload });
   });
 
-  app.post('/api/auth/sign-out', async (req, res) => {
-    const sessionId = String((req.cookies && req.cookies[SESSION_COOKIE]) || '').trim();
+  async function handleSignOut(req, res) {
+    const sessionId = (req.auth && req.auth.session && String(req.auth.session.id || '').trim()) || extractSessionIdFromRequest(req);
     if (sessionId) await destroySession(sessionId);
     clearSessionCookie(res);
     res.json({ ok: true });
-  });
+  }
+
+  app.post('/api/auth/sign-out', handleSignOut);
+  // Backward-compatible alias for older clients.
+  app.post('/api/auth/signout', handleSignOut);
 
   app.get('/api/snapshots/published/latest', requireSession, requirePermission('view_catalog'), async (_req, res) => {
     const state = await readDb(db);
@@ -579,7 +599,7 @@ async function createApp(options = {}) {
         }
         const sessionId = await createSession(signIn.user.id, signIn.activeRole);
         setSessionCookie(res, sessionId);
-        res.status(200).json({ ok: true, hard_fail: false, message: signIn.body.message, user: { user_id: signIn.user.id, role: signIn.activeRole === 'admin' ? 'admin' : 'marketer', app_role: signIn.user.isAssistant ? 'assistant_admin' : signIn.user.role === 'admin' ? 'primary_admin' : 'marketer', status: signIn.user.status, force_password_reset: false, first_name: signIn.user.firstName, last_name: signIn.user.lastName, display_name: signIn.user.displayName, work_email: signIn.user.email, wwid: signIn.user.wwid, cloud_account_state: 'ready', created_at: signIn.user.createdAt, updated_at: signIn.user.updatedAt } });
+        res.status(200).json({ ok: true, hard_fail: false, message: signIn.body.message, session_id: sessionId, session_transport: 'cookie_or_bearer', user: { user_id: signIn.user.id, role: signIn.activeRole === 'admin' ? 'admin' : 'marketer', app_role: signIn.user.isAssistant ? 'assistant_admin' : signIn.user.role === 'admin' ? 'primary_admin' : 'marketer', status: signIn.user.status, force_password_reset: false, first_name: signIn.user.firstName, last_name: signIn.user.lastName, display_name: signIn.user.displayName, work_email: signIn.user.email, wwid: signIn.user.wwid, cloud_account_state: 'ready', created_at: signIn.user.createdAt, updated_at: signIn.user.updatedAt } });
         return;
       }
       if (action === 'auth_complete_password_reset') {
