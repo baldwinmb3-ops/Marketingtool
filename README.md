@@ -1,3 +1,3 @@
-# Marketing Tool Backend Deploy Repo
+# Marketing Tool Backend (Render Deploy)
 
-This repo hosts the portable Node backend for cloud demo deployment.
+Portable Node/Express backend for the Marketing Tool demo.

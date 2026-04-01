@@ -1,0 +1,17 @@
+{
+  "name": "marketingtool-backend",
+  "private": true,
+  "version": "1.0.0",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node server/index.cjs",
+    "migrate": "node server/scripts/migrate.cjs",
+    "seed": "node server/scripts/seed.cjs"
+  },
+  "dependencies": {
+    "cookie-parser": "^1.4.7",
+    "cors": "^2.8.5",
+    "express": "^4.21.2",
+    "pg": "^8.16.3"
+  }
+}
