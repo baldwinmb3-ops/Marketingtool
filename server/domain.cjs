@@ -158,6 +158,7 @@ function normalizeUserOperations(input) {
       if (!['create_user', 'update_user', 'set_user_status', 'delete_user'].includes(op)) return null;
       const wwid = normalizeWwid(row.wwid);
       if (!wwid) return null;
+      const forceReset = typeof row.force_password_reset === 'boolean' ? row.force_password_reset : typeof row.forcePasswordReset === 'boolean' ? row.forcePasswordReset : undefined;
       return {
         op,
         wwid,
@@ -165,6 +166,7 @@ function normalizeUserOperations(input) {
         status: normalizeStatus(row.status),
         displayName: String(row.display_name || row.displayName || '').trim(),
         metadata: row.metadata && typeof row.metadata === 'object' ? row.metadata : {},
+        forcePasswordReset: forceReset,
       };
     })
     .filter(Boolean);
@@ -175,6 +177,8 @@ function applyUserOperation(db, op, actor, logAudit) {
   const existing = users.find((entry) => normalizeWwid(entry.wwid) === op.wwid);
   const meta = op.metadata && typeof op.metadata === 'object' ? op.metadata : {};
   const now = nowIso();
+  const forceResetExplicit = typeof op.forcePasswordReset === 'boolean' ? op.forcePasswordReset : null;
+  const shouldForceResetFromMeta = !!meta.temp_password;
 
   function applyRole(target) {
     if (op.role === 'primary_admin') {
@@ -213,6 +217,7 @@ function applyUserOperation(db, op, actor, logAudit) {
     target.passwordHash = hashPassword(String(meta.temp_password || 'Temp123A'));
     applyRole(target);
     target.status = 'active';
+    target.forcePasswordReset = forceResetExplicit !== null ? forceResetExplicit : shouldForceResetFromMeta;
     target.updatedAt = now;
     if (!existing) users.push(target);
     logAudit(db, { action: 'user.create', actorUserId: actor.userId, actorName: actor.name, targetType: 'user', targetId: target.id, details: { wwid: target.wwid, role: target.role } });
@@ -228,6 +233,7 @@ function applyUserOperation(db, op, actor, logAudit) {
     if (meta.work_email || meta.email) existing.email = normalizeEmail(meta.work_email || meta.email);
     if (op.displayName || meta.display_name) existing.displayName = String(op.displayName || meta.display_name).trim();
     if (meta.temp_password) existing.passwordHash = hashPassword(String(meta.temp_password));
+    existing.forcePasswordReset = forceResetExplicit !== null ? forceResetExplicit : shouldForceResetFromMeta ? true : existing.forcePasswordReset;
     existing.updatedAt = now;
     logAudit(db, { action: 'user.update', actorUserId: actor.userId, actorName: actor.name, targetType: 'user', targetId: existing.id, details: { wwid: existing.wwid } });
     return;
