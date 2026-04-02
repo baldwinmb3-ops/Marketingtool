@@ -8,6 +8,7 @@ const {
   normalizeRole,
   normalizeStatus,
   normalizeIdentifier,
+  normalizeEmail,
   verifyPassword,
   hashPassword,
   randomId,
@@ -255,13 +256,101 @@ async function createApp(options = {}) {
     return { status: 200, body: { ok: true, message: `Signed in as ${activeRole}.` }, user, activeRole };
   }
 
+  async function verifyUserLoginStateCore(input = {}) {
+    const src = input && typeof input === 'object' ? input : {};
+    const requestedRole = normalizeRole(src.role) || 'marketer';
+    const identifier =
+      normalizeIdentifier(src.identifier || src.wwid || src.expected_wwid || src.expected_email || src.email || '') || '';
+    const expectedWwid = normalizeIdentifier(src.expected_wwid || src.wwid || '') || '';
+    const expectedEmail = normalizeEmail(src.expected_email || src.email || '');
+    const expectedPassword = String(src.expected_password || src.password || '').trim();
+    const expectedForcePasswordReset =
+      typeof src.expected_force_password_reset === 'boolean' ? src.expected_force_password_reset : null;
+    const row = identifier ? await findUserRowByIdentifier(db, identifier, requestedRole) : null;
+    const user = row ? mapUserToState(row) : null;
+    const checks = {
+      user_exists: !!user,
+      role_match: !!user,
+      wwid_match: !expectedWwid,
+      email_match: !expectedEmail,
+      force_password_reset_match: expectedForcePasswordReset === null,
+      password_match: !expectedPassword,
+    };
+    const failures = [];
+    if (!user) {
+      failures.push({ code: 'MISSING_USER', message: 'Cloud user was not found for this WWID/work email.' });
+      return {
+        ok: true,
+        ready: false,
+        verification_state: 'repair_required',
+        message: failures[0].message,
+        checks,
+        failures,
+        user: null,
+      };
+    }
+    const access = deriveAccess(user);
+    checks.role_match = access.availableRoles.includes(requestedRole);
+    if (!checks.role_match) {
+      failures.push({ code: 'ROLE_MISMATCH', message: `Cloud account is not enabled for ${requestedRole}.` });
+    }
+    if (expectedWwid) {
+      checks.wwid_match = String(user.wwid || '').trim().toUpperCase() === String(expectedWwid).trim().toUpperCase();
+      if (!checks.wwid_match) {
+        failures.push({ code: 'WWID_MISMATCH', message: 'Cloud WWID does not match the admin record.' });
+      }
+    }
+    if (expectedEmail) {
+      checks.email_match = normalizeEmail(user.email || '') === expectedEmail;
+      if (!checks.email_match) {
+        failures.push({ code: 'EMAIL_MISMATCH', message: 'Cloud work email does not match the admin record.' });
+      }
+    }
+    if (expectedForcePasswordReset !== null) {
+      checks.force_password_reset_match = !!user.forcePasswordReset === !!expectedForcePasswordReset;
+      if (!checks.force_password_reset_match) {
+        failures.push({ code: 'FORCE_RESET_MISMATCH', message: 'Cloud reset-required flag does not match the admin record.' });
+      }
+    }
+    if (expectedPassword) {
+      checks.password_match = verifyPassword(expectedPassword, user.passwordHash);
+      if (!checks.password_match) {
+        failures.push({ code: 'TEMP_PASSWORD_MISMATCH', message: 'Cloud temp password does not match the admin card.' });
+      }
+    }
+    const verificationState = failures.length ? 'drift_detected' : 'cloud_ready';
+    return {
+      ok: true,
+      ready: verificationState === 'cloud_ready',
+      verification_state: verificationState,
+      message: failures.length ? failures[0].message : 'Cloud login state verified.',
+      checks,
+      failures,
+      user: {
+        user_id: user.id,
+        role: requestedRole,
+        app_role: user.isAssistant ? 'assistant_admin' : user.role === 'admin' ? 'primary_admin' : 'marketer',
+        status: user.status,
+        force_password_reset: !!user.forcePasswordReset,
+        first_name: user.firstName,
+        last_name: user.lastName,
+        display_name: user.displayName,
+        work_email: user.email,
+        wwid: user.wwid,
+        cloud_account_state: verificationState === 'cloud_ready' ? 'ready' : 'drift',
+        created_at: user.createdAt,
+        updated_at: user.updatedAt,
+      },
+    };
+  }
+
   app.use(attachAuth);
 
   app.get('/api/health', (_req, res) => {
     res.json({ ok: true, service: 'marketingtool-backend', at: nowIso() });
   });
 
-  app.get('/api/users', requireSession, requirePermission('manage_admin_updates'), async (_req, res, next) => {
+  app.get('/api/users', requireSession, requirePermission('manage_admin_updates'), async (req, res, next) => {
     try {
       const rows = await listUsers(db);
       const users = Array.isArray(rows) ? rows.map(mapUserForClient).filter(Boolean) : [];
@@ -642,6 +731,16 @@ async function createApp(options = {}) {
         res.json({ ok: true, found: true, account_state: 'ready', message: 'Cloud account found.', user: { role: requestedRole || 'marketer', status: user.status, force_password_reset: !!user.forcePasswordReset, cloud_account_state: 'ready', wwid: user.wwid, work_email: user.email, updated_at: user.updatedAt } });
         return;
       }
+      if (action === 'verify_user_login_state') {
+        const permissions = req.auth.payload.permissions || {};
+        if (!permissions.manage_admin_updates) {
+          res.status(403).json({ ok: false, message: 'Only admins can verify cloud user login state.' });
+          return;
+        }
+        const verification = await verifyUserLoginStateCore(body);
+        res.status(200).json(verification);
+        return;
+      }
       if (action === 'auth_sign_in') {
         const signIn = await signInCore(normalizeIdentifier(body.identifier), String(body.password || ''), normalizeRole(body.role));
         if (!signIn.body.ok || !signIn.user) {
@@ -927,9 +1026,9 @@ async function createApp(options = {}) {
         return;
       }
       if (action === 'save_and_send') {
-        await withDb(db, async (db) => {
+        const result = await withDb(db, async (db) => {
           const permissions = req.auth.payload.permissions || {};
-          if (!permissions.publish_catalog) { res.status(403).json({ ok: false, message: 'Only admins can publish snapshots.' }); return; }
+          if (!permissions.publish_catalog) return { status: 403, body: { ok: false, message: 'Only admins can publish snapshots.' } };
           const payload = sanitizeCatalogPayload(body.payload);
           const userOps = normalizeUserOperations(body.user_operations);
           const currentPublished = db.snapshots && db.snapshots.published ? db.snapshots.published : null;
@@ -946,8 +1045,56 @@ async function createApp(options = {}) {
           const actor = { userId: req.auth.user.id, name: req.auth.user.displayName };
           userOps.forEach((op) => applyUserOperation(db, op, actor, logAudit));
           logAudit(db, { action: 'catalog.save_and_send', actorUserId: req.auth.user.id, actorName: req.auth.user.displayName, targetType: 'snapshot', targetId: String(nextVersion), details: { version: nextVersion, userOperations: userOps.length } });
-          res.json({ ok: true, request_id: String(body.request_id || randomId('request')).toLowerCase(), message: 'Cloud synced.', version: nextVersion, published_at: stamp, account_readiness: { pending: 0, ready: userOps.filter((op) => op.op === 'create_user').length, failed: 0 }, user_operations: { received: userOps.length, queued: userOps.length } });
+          return {
+            status: 200,
+            body: {
+              ok: true,
+              request_id: String(body.request_id || randomId('request')).toLowerCase(),
+              message: 'Cloud synced.',
+              version: nextVersion,
+              published_at: stamp,
+              account_readiness: { pending: 0, ready: userOps.filter((op) => op.op === 'create_user').length, failed: 0 },
+              user_operations: { received: userOps.length, queued: userOps.length },
+            },
+          };
         });
+        res.status(result.status || 200).json(result.body || { ok: false, message: 'Cloud sync failed.' });
+        return;
+      }
+      if (action === 'apply_user_operations') {
+        const result = await withDb(db, async (db) => {
+          const permissions = req.auth.payload.permissions || {};
+          if (!permissions.manage_admin_updates) {
+            return { status: 403, body: { ok: false, message: 'Only admins can sync user login state.' } };
+          }
+          const userOps = normalizeUserOperations(body.user_operations || body.operations);
+          if (!userOps.length) {
+            return { status: 200, body: { ok: true, message: 'No user operations were supplied.', user_operations: { received: 0, applied: 0 } } };
+          }
+          const actor = { userId: req.auth.user.id, name: req.auth.user.displayName };
+          userOps.forEach((op) => applyUserOperation(db, op, actor, logAudit));
+          logAudit(db, {
+            action: 'user.apply_operations',
+            actorUserId: req.auth.user.id,
+            actorName: req.auth.user.displayName,
+            targetType: 'user',
+            targetId: userOps.map((op) => op.wwid).join(','),
+            details: { operations: userOps.length },
+          });
+          return {
+            status: 200,
+            body: {
+              ok: true,
+              message: `Applied ${userOps.length} user operation${userOps.length === 1 ? '' : 's'}.`,
+              user_operations: {
+                received: userOps.length,
+                applied: userOps.length,
+                wwids: userOps.map((op) => op.wwid),
+              },
+            },
+          };
+        });
+        res.status(result.status || 200).json(result.body || { ok: false, message: 'Cloud user sync failed.' });
         return;
       }
       res.status(400).json({ ok: false, message: `Unsupported action "${actionRaw || 'unknown'}".` });
