@@ -171,6 +171,7 @@ function createSeedUsers() {
       managerOnly: false,
       status: 'active',
       isLocked: false,
+      forcePasswordReset: false,
       passwordHash: hashPassword('Admin123A'),
       createdAt: t,
       updatedAt: t,
@@ -190,6 +191,7 @@ function createSeedUsers() {
       managerOnly: false,
       status: 'active',
       isLocked: false,
+      forcePasswordReset: false,
       passwordHash: hashPassword('Assist123A'),
       createdAt: t,
       updatedAt: t,
@@ -209,6 +211,7 @@ function createSeedUsers() {
       managerOnly: false,
       status: 'active',
       isLocked: false,
+      forcePasswordReset: false,
       passwordHash: hashPassword('Marketer123A'),
       createdAt: t,
       updatedAt: t,
@@ -228,6 +231,7 @@ function createSeedUsers() {
       managerOnly: false,
       status: 'active',
       isLocked: false,
+      forcePasswordReset: false,
       passwordHash: hashPassword('MarketerTwo123A'),
       createdAt: t,
       updatedAt: t,
@@ -247,6 +251,7 @@ function createSeedUsers() {
       managerOnly: true,
       status: 'active',
       isLocked: false,
+      forcePasswordReset: false,
       passwordHash: hashPassword('Manager123A'),
       createdAt: t,
       updatedAt: t,
@@ -266,6 +271,7 @@ function createSeedUsers() {
       managerOnly: false,
       status: 'active',
       isLocked: false,
+      forcePasswordReset: false,
       passwordHash: hashPassword('ManagerAll123A'),
       createdAt: t,
       updatedAt: t,
@@ -455,10 +461,85 @@ function mapUserToState(row) {
     managerOnly: toBool(row.manager_only, false),
     status: String(row.status || 'active'),
     isLocked: toBool(row.is_locked, false),
+    forcePasswordReset: toBool(row.force_password_reset, false),
     passwordHash: String(row.password_hash || ''),
     createdAt: toIso(row.created_at),
     updatedAt: toIso(row.updated_at),
   };
+}
+
+function buildRoleCondition(role) {
+  if (!role) return '';
+  if (role === 'admin') {
+    return "AND (role = 'admin' OR can_access_admin = TRUE)";
+  }
+  if (role === 'marketer') {
+    return "AND (role = 'marketer' OR role = 'admin' OR can_access_marketer = TRUE)";
+  }
+  if (role === 'manager') {
+    return 'AND can_access_manager = TRUE';
+  }
+  return '';
+}
+
+async function selectUserRowByIdentifier(client, identifier, requestedRole) {
+  const key = normalizeIdentifier(identifier);
+  if (!key) return null;
+  const normalizedWwid = normalizeWwid(key);
+  const normalizedEmail = normalizeEmail(key);
+  if (!normalizedWwid && !normalizedEmail) return null;
+  const roleClause = buildRoleCondition(normalizeRole(requestedRole));
+  const sql = `
+    SELECT *
+    FROM users
+    WHERE status = $1
+      AND (
+        ($2 <> '' AND wwid = $2)
+        OR ($3 <> '' AND email = $3)
+      )
+      ${roleClause}
+    ORDER BY created_at ASC
+    LIMIT 1
+  `;
+  const params = ['active', normalizedWwid || '', normalizedEmail || ''];
+  const result = await client.query(sql, params);
+  return result.rows[0] || null;
+}
+
+async function findUserRowByIdentifier(pool, identifier, requestedRole = null) {
+  if (!pool) return null;
+  const client = await pool.connect();
+  try {
+    return await selectUserRowByIdentifier(client, identifier, requestedRole);
+  } finally {
+    client.release();
+  }
+}
+
+async function selectUsers(client) {
+  const result = await client.query('SELECT * FROM users ORDER BY created_at ASC');
+  return result.rows.map(mapUserToState);
+}
+
+async function listUsers(pool) {
+  const client = await pool.connect();
+  try {
+    return await selectUsers(client);
+  } finally {
+    client.release();
+  }
+}
+
+async function updateUserPassword(pool, userId, passwordHash, forcePasswordReset = false, updatedAt = nowIso()) {
+  const client = await pool.connect();
+  try {
+    await client.query(
+      `UPDATE users SET password_hash = $1, force_password_reset = $2, updated_at = $3 WHERE id = $4`,
+      [String(passwordHash || ''), toBool(forcePasswordReset, false), toIso(updatedAt), String(userId || '')],
+    );
+  } finally {
+    client.release();
+  }
 }
 
 async function readDbInternal(client) {
@@ -541,11 +622,11 @@ async function upsertUserRow(client, user) {
     `INSERT INTO users (
       id, display_name, first_name, last_name, wwid, email, role,
       is_assistant, can_access_marketer, can_access_admin, can_access_manager, manager_only,
-      status, is_locked, password_hash, created_at, updated_at
+      status, is_locked, password_hash, force_password_reset, created_at, updated_at
     ) VALUES (
       $1,$2,$3,$4,$5,$6,$7,
       $8,$9,$10,$11,$12,
-      $13,$14,$15,$16,$17
+      $13,$14,$15,$16,$17,$18
     )
     ON CONFLICT (id) DO UPDATE SET
       display_name = EXCLUDED.display_name,
@@ -562,6 +643,7 @@ async function upsertUserRow(client, user) {
       status = EXCLUDED.status,
       is_locked = EXCLUDED.is_locked,
       password_hash = EXCLUDED.password_hash,
+      force_password_reset = EXCLUDED.force_password_reset,
       updated_at = EXCLUDED.updated_at`,
     [
       String(row.id || ''),
@@ -579,6 +661,7 @@ async function upsertUserRow(client, user) {
       normalizeStatus(row.status),
       !!row.isLocked,
       String(row.passwordHash || ''),
+      !!row.forcePasswordReset,
       toIso(row.createdAt),
       toIso(row.updatedAt),
     ],
@@ -995,10 +1078,14 @@ module.exports = {
   readDb,
   withDb,
   findUserByIdentifier,
+  findUserRowByIdentifier,
+  listUsers,
+  mapUserToState,
   logAudit,
   logBookingEvent,
   createSessionRecord,
   getSessionRecord,
   revokeSessionRecord,
+  updateUserPassword,
   closePool,
 };

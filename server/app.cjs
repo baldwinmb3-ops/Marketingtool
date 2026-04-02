@@ -6,6 +6,7 @@ const {
   nowIso,
   toInt,
   normalizeRole,
+  normalizeStatus,
   normalizeIdentifier,
   verifyPassword,
   hashPassword,
@@ -17,12 +18,16 @@ const {
   initDatabase,
   readDb,
   withDb,
+  listUsers,
   findUserByIdentifier,
+  findUserRowByIdentifier,
+  mapUserToState,
   logAudit,
   logBookingEvent,
   createSessionRecord,
   getSessionRecord,
   revokeSessionRecord,
+  updateUserPassword,
 } = require('./db.cjs');
 const { deriveAccess, buildSessionPayload } = require('./authz.cjs');
 const {
@@ -90,6 +95,8 @@ async function createApp(options = {}) {
   if (options.initializeDatabase !== false) {
     await initDatabase(db, { seed: options.seedDatabase !== false });
   }
+
+  const appVersion = String(process.env.APP_VERSION || `dev-${Date.now()}`);
 
   app.use(
     cors({
@@ -181,10 +188,36 @@ async function createApp(options = {}) {
     };
   }
 
+  function mapUserForClient(user) {
+    if (!user || typeof user !== 'object') return null;
+    const status = normalizeStatus(user.status || 'active');
+    const normalizedRole = normalizeRole(user.role || 'marketer');
+    return {
+      id: String(user.id || ''),
+      name: String(user.displayName || `${user.firstName || ''} ${user.lastName || ''}`).trim() || 'User',
+      firstName: String(user.firstName || '').trim(),
+      lastName: String(user.lastName || '').trim(),
+      wwid: String(user.wwid || '').trim(),
+      workEmail: String(user.email || '').trim().toLowerCase(),
+      emailOrLogin: String(user.email || '').trim().toLowerCase(),
+      role: normalizedRole,
+      isAssistant: !!user.isAssistant,
+      canAccessMarketer: !!user.canAccessMarketer,
+      canAccessAdmin: !!user.canAccessAdmin,
+      canAccessManager: !!user.canAccessManager,
+      managerOnly: !!user.managerOnly,
+      active: status === 'active',
+      status,
+      isLocked: !!user.isLocked,
+      forcePasswordReset: !!user.forcePasswordReset,
+      createdAt: String(user.createdAt || ''),
+      updatedAt: String(user.updatedAt || ''),
+    };
+  }
+
   async function signInCore(identifier, password, requestedRole) {
-    const snapshot = await readDb(db);
-    const user = findUserByIdentifier(snapshot, identifier, requestedRole);
-    if (!user) {
+    const row = await findUserRowByIdentifier(db, identifier, requestedRole);
+    if (!row) {
       return {
         status: 401,
         body: { ok: false, message: 'No active account matched this WWID/work email.' },
@@ -192,6 +225,7 @@ async function createApp(options = {}) {
         activeRole: null,
       };
     }
+    const user = mapUserToState(row);
     if (user.isLocked) {
       return {
         status: 403,
@@ -225,6 +259,21 @@ async function createApp(options = {}) {
 
   app.get('/api/health', (_req, res) => {
     res.json({ ok: true, service: 'marketingtool-backend', at: nowIso() });
+  });
+
+  app.get('/api/users', requireSession, requirePermission('manage_admin_updates'), async (_req, res, next) => {
+    try {
+      const rows = await listUsers(db);
+      const users = Array.isArray(rows) ? rows.map(mapUserForClient).filter(Boolean) : [];
+      res.json({ ok: true, users });
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.get('/version.json', (_req, res) => {
+    res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0');
+    res.json({ ok: true, version: appVersion, updatedAt: nowIso() });
   });
 
   app.post('/api/auth/sign-in', async (req, res, next) => {
@@ -578,17 +627,19 @@ async function createApp(options = {}) {
         return;
       }
       if (action === 'auth_lookup') {
-        const state = await readDb(db);
-        const user = findUserByIdentifier(state, body.identifier, body.role);
-        if (!body.identifier) {
+        const identifier = normalizeIdentifier(body.identifier);
+        if (!identifier) {
           res.json({ ok: true, found: false, account_state: 'missing', message: 'Identifier is required.' });
           return;
         }
+        const requestedRole = normalizeRole(body.role);
+        const row = await findUserRowByIdentifier(db, identifier, requestedRole);
+        const user = row ? mapUserToState(row) : null;
         if (!user) {
           res.json({ ok: true, found: false, account_state: 'missing', message: 'No account matched that role and login.' });
           return;
         }
-        res.json({ ok: true, found: true, account_state: 'ready', message: 'Cloud account found.', user: { role: normalizeRole(body.role) || 'marketer', status: user.status, force_password_reset: false, cloud_account_state: 'ready', wwid: user.wwid, work_email: user.email, updated_at: user.updatedAt } });
+        res.json({ ok: true, found: true, account_state: 'ready', message: 'Cloud account found.', user: { role: requestedRole || 'marketer', status: user.status, force_password_reset: !!user.forcePasswordReset, cloud_account_state: 'ready', wwid: user.wwid, work_email: user.email, updated_at: user.updatedAt } });
         return;
       }
       if (action === 'auth_sign_in') {
@@ -599,7 +650,7 @@ async function createApp(options = {}) {
         }
         const sessionId = await createSession(signIn.user.id, signIn.activeRole);
         setSessionCookie(res, sessionId);
-        res.status(200).json({ ok: true, hard_fail: false, message: signIn.body.message, session_id: sessionId, session_transport: 'cookie_or_bearer', user: { user_id: signIn.user.id, role: signIn.activeRole === 'admin' ? 'admin' : 'marketer', app_role: signIn.user.isAssistant ? 'assistant_admin' : signIn.user.role === 'admin' ? 'primary_admin' : 'marketer', status: signIn.user.status, force_password_reset: false, first_name: signIn.user.firstName, last_name: signIn.user.lastName, display_name: signIn.user.displayName, work_email: signIn.user.email, wwid: signIn.user.wwid, cloud_account_state: 'ready', created_at: signIn.user.createdAt, updated_at: signIn.user.updatedAt } });
+        res.status(200).json({ ok: true, hard_fail: false, message: signIn.body.message, session_id: sessionId, session_transport: 'cookie_or_bearer', user: { user_id: signIn.user.id, role: signIn.activeRole === 'admin' ? 'admin' : 'marketer', app_role: signIn.user.isAssistant ? 'assistant_admin' : signIn.user.role === 'admin' ? 'primary_admin' : 'marketer', status: signIn.user.status, force_password_reset: !!signIn.user.forcePasswordReset, first_name: signIn.user.firstName, last_name: signIn.user.lastName, display_name: signIn.user.displayName, work_email: signIn.user.email, wwid: signIn.user.wwid, cloud_account_state: 'ready', created_at: signIn.user.createdAt, updated_at: signIn.user.updatedAt } });
         return;
       }
       if (action === 'auth_complete_password_reset') {
@@ -615,41 +666,47 @@ async function createApp(options = {}) {
           res.status(200).json({ ok: false, message: 'New password must include at least 1 capital letter and at least 1 number.' });
           return;
         }
-        await withDb(db, async (db) => {
-          const user = findUserByIdentifier(db, identifier, role);
-          if (!user) {
-            res.status(200).json({ ok: false, message: 'No active account matched that role + login.' });
-            return;
-          }
-          if (!verifyPassword(currentPassword, user.passwordHash)) {
-            res.status(200).json({ ok: false, message: 'Current password did not match.' });
-            return;
-          }
-          if (currentPassword === newPassword) {
-            res.status(200).json({ ok: false, message: 'New password must be different from temporary password.' });
-            return;
-          }
-          user.passwordHash = hashPassword(newPassword);
-          user.updatedAt = nowIso();
-          res.status(200).json({
-            ok: true,
-            message: 'Password updated.',
-            user: {
-              user_id: user.id,
-              role,
-              app_role: user.isAssistant ? 'assistant_admin' : user.role === 'admin' ? 'primary_admin' : 'marketer',
-              status: user.status,
-              force_password_reset: false,
-              first_name: user.firstName,
-              last_name: user.lastName,
-              display_name: user.displayName,
-              work_email: user.email,
-              wwid: user.wwid,
-              cloud_account_state: 'ready',
-              created_at: user.createdAt,
-              updated_at: user.updatedAt,
-            },
-          });
+        const row = await findUserRowByIdentifier(db, identifier, role);
+        if (!row) {
+          res.status(200).json({ ok: false, message: 'No active account matched that role + login.' });
+          return;
+        }
+        if (!verifyPassword(currentPassword, row.password_hash || '')) {
+          res.status(200).json({ ok: false, message: 'Current password did not match.' });
+          return;
+        }
+        if (currentPassword === newPassword) {
+          res.status(200).json({ ok: false, message: 'New password must be different from temporary password.' });
+          return;
+        }
+        const newHash = hashPassword(newPassword);
+        const updatedAt = nowIso();
+        await updateUserPassword(db, row.id, newHash, false, updatedAt);
+        const updatedRow = {
+          ...row,
+          password_hash: newHash,
+          force_password_reset: false,
+          updated_at: updatedAt,
+        };
+        const user = mapUserToState(updatedRow);
+        res.status(200).json({
+          ok: true,
+          message: 'Password updated.',
+          user: {
+            user_id: user.id,
+            role,
+            app_role: user.isAssistant ? 'assistant_admin' : user.role === 'admin' ? 'primary_admin' : 'marketer',
+            status: user.status,
+            force_password_reset: !!user.forcePasswordReset,
+            first_name: user.firstName,
+            last_name: user.lastName,
+            display_name: user.displayName,
+            work_email: user.email,
+            wwid: user.wwid,
+            cloud_account_state: 'ready',
+            created_at: user.createdAt,
+            updated_at: user.updatedAt,
+          },
         });
         return;
       }
