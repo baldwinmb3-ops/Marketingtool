@@ -251,6 +251,21 @@ async function createApp(options = {}) {
     return '';
   }
 
+  function userSupportsVerificationRole(user, requestedRole) {
+    const row = user && typeof user === 'object' ? user : {};
+    const baseRole = normalizeRole(row.role) || 'marketer';
+    if (requestedRole === 'admin') {
+      return baseRole === 'admin' || !!row.canAccessAdmin;
+    }
+    if (requestedRole === 'marketer') {
+      return baseRole === 'marketer' || !!row.canAccessMarketer;
+    }
+    if (requestedRole === 'manager') {
+      return !!row.canAccessManager;
+    }
+    return false;
+  }
+
   async function signInCore(identifier, password, requestedRole) {
     const row = await findUserRowByIdentifier(db, identifier, requestedRole);
     if (!row) {
@@ -324,8 +339,7 @@ async function createApp(options = {}) {
         user: null,
       };
     }
-    const access = deriveAccess(user);
-    checks.role_match = access.availableRoles.includes(requestedRole);
+    checks.role_match = userSupportsVerificationRole(user, requestedRole);
     if (!checks.role_match) {
       failures.push({ code: 'ROLE_MISMATCH', message: `Cloud account is not enabled for ${requestedRole}.` });
     }
