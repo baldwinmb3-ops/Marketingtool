@@ -517,7 +517,7 @@ async function findUserRowByIdentifier(pool, identifier, requestedRole = null) {
 }
 
 async function selectUsers(client) {
-  const result = await client.query('SELECT * FROM users ORDER BY created_at ASC');
+  const result = await client.query("SELECT * FROM users WHERE COALESCE(status, 'active') <> 'deleted' ORDER BY created_at ASC");
   return result.rows.map(mapUserToState);
 }
 
