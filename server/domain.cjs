@@ -172,6 +172,30 @@ function normalizeUserOperations(input) {
     .filter(Boolean);
 }
 
+function normalizeDepartmentIds(value, fallback = []) {
+  const raw = Array.isArray(value)
+    ? value
+    : typeof value === 'string'
+      ? (() => {
+          try {
+            return JSON.parse(value);
+          } catch {
+            return fallback;
+          }
+        })()
+      : fallback;
+  if (!Array.isArray(raw)) return Array.isArray(fallback) ? fallback : [];
+  const seen = new Set();
+  const out = [];
+  raw.forEach((entry) => {
+    const id = String(entry || '').trim();
+    if (!id || seen.has(id)) return;
+    seen.add(id);
+    out.push(id);
+  });
+  return out;
+}
+
 function applyUserOperation(db, op, actor, logAudit) {
   const users = Array.isArray(db.users) ? db.users : [];
   const existing = users.find((entry) => normalizeWwid(entry.wwid) === op.wwid);
@@ -207,6 +231,10 @@ function applyUserOperation(db, op, actor, logAudit) {
     target.managerOnly = !!meta.manager_only;
   }
 
+  function applyDepartments(target) {
+    target.departmentIds = normalizeDepartmentIds(meta.department_ids ?? meta.departmentIds, target.departmentIds || []);
+  }
+
   if (op.op === 'create_user') {
     const target = existing || { id: randomId('user'), createdAt: now, updatedAt: now, status: 'active', isLocked: false, wwid: op.wwid };
     target.wwid = op.wwid;
@@ -216,6 +244,7 @@ function applyUserOperation(db, op, actor, logAudit) {
     target.email = normalizeEmail(meta.work_email || meta.email || target.email || `${op.wwid.toLowerCase()}@example.local`);
     target.passwordHash = hashPassword(String(meta.temp_password || 'Temp123A'));
     applyRole(target);
+    applyDepartments(target);
     target.status = 'active';
     target.forcePasswordReset = forceResetExplicit !== null ? forceResetExplicit : shouldForceResetFromMeta;
     target.updatedAt = now;
@@ -233,6 +262,7 @@ function applyUserOperation(db, op, actor, logAudit) {
     if (meta.work_email || meta.email) existing.email = normalizeEmail(meta.work_email || meta.email);
     if (op.displayName || meta.display_name) existing.displayName = String(op.displayName || meta.display_name).trim();
     if (meta.temp_password) existing.passwordHash = hashPassword(String(meta.temp_password));
+    applyDepartments(existing);
     existing.forcePasswordReset = forceResetExplicit !== null ? forceResetExplicit : shouldForceResetFromMeta ? true : existing.forcePasswordReset;
     existing.updatedAt = now;
     logAudit(db, { action: 'user.update', actorUserId: actor.userId, actorName: actor.name, targetType: 'user', targetId: existing.id, details: { wwid: existing.wwid } });

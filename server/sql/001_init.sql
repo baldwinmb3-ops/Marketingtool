@@ -11,6 +11,7 @@ CREATE TABLE IF NOT EXISTS users (
   can_access_admin BOOLEAN NOT NULL DEFAULT FALSE,
   can_access_manager BOOLEAN NOT NULL DEFAULT FALSE,
   manager_only BOOLEAN NOT NULL DEFAULT FALSE,
+  department_ids JSONB NOT NULL DEFAULT '[]'::jsonb,
   status TEXT NOT NULL DEFAULT 'active',
   is_locked BOOLEAN NOT NULL DEFAULT FALSE,
   password_hash TEXT NOT NULL,
@@ -99,3 +100,4 @@ CREATE TABLE IF NOT EXISTS audit_log (
 CREATE INDEX IF NOT EXISTS idx_audit_log_at ON audit_log(at DESC);
 
 ALTER TABLE users ADD COLUMN IF NOT EXISTS force_password_reset BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS department_ids JSONB NOT NULL DEFAULT '[]'::jsonb;

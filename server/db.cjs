@@ -40,6 +40,20 @@ function asJson(value, fallback) {
   return fallback;
 }
 
+function normalizeDepartmentIds(value) {
+  const source = Array.isArray(value) ? value : asJson(value, []);
+  if (!Array.isArray(source)) return [];
+  const seen = new Set();
+  const out = [];
+  source.forEach((entry) => {
+    const id = String(entry || '').trim();
+    if (!id || seen.has(id)) return;
+    seen.add(id);
+    out.push(id);
+  });
+  return out;
+}
+
 function createSeedSnapshot() {
   const t = nowIso();
   return {
@@ -209,6 +223,7 @@ function createSeedUsers() {
       canAccessAdmin: false,
       canAccessManager: false,
       managerOnly: false,
+      departmentIds: ['manager-cat-stores'],
       status: 'active',
       isLocked: false,
       forcePasswordReset: false,
@@ -229,6 +244,7 @@ function createSeedUsers() {
       canAccessAdmin: false,
       canAccessManager: false,
       managerOnly: false,
+      departmentIds: ['manager-cat-hotels'],
       status: 'active',
       isLocked: false,
       forcePasswordReset: false,
@@ -249,6 +265,7 @@ function createSeedUsers() {
       canAccessAdmin: false,
       canAccessManager: true,
       managerOnly: true,
+      departmentIds: ['manager-cat-stores'],
       status: 'active',
       isLocked: false,
       forcePasswordReset: false,
@@ -269,6 +286,7 @@ function createSeedUsers() {
       canAccessAdmin: true,
       canAccessManager: true,
       managerOnly: false,
+      departmentIds: ['manager-cat-hotels'],
       status: 'active',
       isLocked: false,
       forcePasswordReset: false,
@@ -459,6 +477,7 @@ function mapUserToState(row) {
     canAccessAdmin: toBool(row.can_access_admin, false),
     canAccessManager: toBool(row.can_access_manager, false),
     managerOnly: toBool(row.manager_only, false),
+    departmentIds: normalizeDepartmentIds(row.department_ids),
     status: String(row.status || 'active'),
     isLocked: toBool(row.is_locked, false),
     forcePasswordReset: toBool(row.force_password_reset, false),
@@ -622,11 +641,11 @@ async function upsertUserRow(client, user) {
     `INSERT INTO users (
       id, display_name, first_name, last_name, wwid, email, role,
       is_assistant, can_access_marketer, can_access_admin, can_access_manager, manager_only,
-      status, is_locked, password_hash, force_password_reset, created_at, updated_at
+      department_ids, status, is_locked, password_hash, force_password_reset, created_at, updated_at
     ) VALUES (
       $1,$2,$3,$4,$5,$6,$7,
       $8,$9,$10,$11,$12,
-      $13,$14,$15,$16,$17,$18
+      $13,$14,$15,$16,$17,$18,$19
     )
     ON CONFLICT (id) DO UPDATE SET
       display_name = EXCLUDED.display_name,
@@ -640,6 +659,7 @@ async function upsertUserRow(client, user) {
       can_access_admin = EXCLUDED.can_access_admin,
       can_access_manager = EXCLUDED.can_access_manager,
       manager_only = EXCLUDED.manager_only,
+      department_ids = EXCLUDED.department_ids,
       status = EXCLUDED.status,
       is_locked = EXCLUDED.is_locked,
       password_hash = EXCLUDED.password_hash,
@@ -658,6 +678,7 @@ async function upsertUserRow(client, user) {
       !!row.canAccessAdmin,
       !!row.canAccessManager,
       !!row.managerOnly,
+      JSON.stringify(normalizeDepartmentIds(row.departmentIds)),
       normalizeStatus(row.status),
       !!row.isLocked,
       String(row.passwordHash || ''),

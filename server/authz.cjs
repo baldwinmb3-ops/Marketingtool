@@ -15,8 +15,10 @@ function toPublicUser(user) {
     canAccessAdmin: !!user.canAccessAdmin,
     canAccessManager: !!user.canAccessManager,
     managerOnly: !!user.managerOnly,
+    departmentIds: Array.isArray(user.departmentIds) ? user.departmentIds.map((entry) => String(entry || '').trim()).filter(Boolean) : [],
     status: String(user.status || 'active'),
     isLocked: !!user.isLocked,
+    forcePasswordReset: !!user.forcePasswordReset,
     createdAt: String(user.createdAt || ''),
     updatedAt: String(user.updatedAt || ''),
   };
@@ -44,6 +46,7 @@ function deriveAccess(user) {
     permissions: {
       publish_catalog: canAdmin,
       manage_admin_updates: canAdmin,
+      manage_marketer_users: canAdmin || canManager,
       manage_manager_roster: canAdmin,
       booking_create: canAdmin || canMarketer,
       booking_manage: canAdmin,

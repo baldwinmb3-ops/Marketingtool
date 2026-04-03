@@ -207,6 +207,7 @@ async function createApp(options = {}) {
       canAccessAdmin: !!user.canAccessAdmin,
       canAccessManager: !!user.canAccessManager,
       managerOnly: !!user.managerOnly,
+      departmentIds: Array.isArray(user.departmentIds) ? user.departmentIds.map((entry) => String(entry || '').trim()).filter(Boolean) : [],
       active: status === 'active',
       status,
       isLocked: !!user.isLocked,
@@ -214,6 +215,40 @@ async function createApp(options = {}) {
       createdAt: String(user.createdAt || ''),
       updatedAt: String(user.updatedAt || ''),
     };
+  }
+
+  function requestPermissions(req) {
+    return req && req.auth && req.auth.payload && req.auth.payload.permissions && typeof req.auth.payload.permissions === 'object'
+      ? req.auth.payload.permissions
+      : {};
+  }
+
+  function managerUserOperationRestrictionMessage(userOps) {
+    const list = Array.isArray(userOps) ? userOps : [];
+    for (const op of list) {
+      const row = op && typeof op === 'object' ? op : {};
+      const metadata = row.metadata && typeof row.metadata === 'object' && !Array.isArray(row.metadata) ? row.metadata : {};
+      const role = String(row.role || '').trim().toLowerCase();
+      if (!['create_user', 'update_user', 'set_user_status'].includes(String(row.op || '').trim().toLowerCase())) {
+        return 'Managers can only create or update marketer accounts.';
+      }
+      if (role !== 'marketer') {
+        return 'Managers can only sync marketer accounts.';
+      }
+      if (
+        !!metadata.can_access_admin ||
+        !!metadata.canAccessAdmin ||
+        !!metadata.can_access_manager ||
+        !!metadata.canAccessManager ||
+        !!metadata.manager_only ||
+        !!metadata.managerOnly ||
+        !!metadata.is_assistant ||
+        !!metadata.isAssistant
+      ) {
+        return 'Managers cannot grant admin or manager access while syncing marketers.';
+      }
+    }
+    return '';
   }
 
   async function signInCore(identifier, password, requestedRole) {
@@ -350,10 +385,20 @@ async function createApp(options = {}) {
     res.json({ ok: true, service: 'marketingtool-backend', at: nowIso() });
   });
 
-  app.get('/api/users', requireSession, requirePermission('manage_admin_updates'), async (req, res, next) => {
+  app.get('/api/users', requireSession, async (req, res, next) => {
     try {
+      const permissions = requestPermissions(req);
+      const canAdmin = !!permissions.manage_admin_updates;
+      const canManager = !!permissions.manage_marketer_users;
+      if (!canAdmin && !canManager) {
+        res.status(403).json({ ok: false, code: 'FORBIDDEN', message: 'Missing permission: manage_marketer_users' });
+        return;
+      }
       const rows = await listUsers(db);
-      const users = Array.isArray(rows) ? rows.map(mapUserForClient).filter(Boolean) : [];
+      let users = Array.isArray(rows) ? rows.map(mapUserForClient).filter(Boolean) : [];
+      if (!canAdmin) {
+        users = users.filter((user) => normalizeRole(user && user.role) === 'marketer');
+      }
       res.json({ ok: true, users });
     } catch (error) {
       next(error);
@@ -732,9 +777,16 @@ async function createApp(options = {}) {
         return;
       }
       if (action === 'verify_user_login_state') {
-        const permissions = req.auth.payload.permissions || {};
-        if (!permissions.manage_admin_updates) {
-          res.status(403).json({ ok: false, message: 'Only admins can verify cloud user login state.' });
+        const permissions = requestPermissions(req);
+        const canAdmin = !!permissions.manage_admin_updates;
+        const canManager = !!permissions.manage_marketer_users;
+        const requestedRole = normalizeRole(body.role) || 'marketer';
+        if (!canAdmin && !canManager) {
+          res.status(403).json({ ok: false, message: 'Only admins and managers can verify cloud user login state.' });
+          return;
+        }
+        if (!canAdmin && requestedRole !== 'marketer') {
+          res.status(403).json({ ok: false, message: 'Managers can only verify marketer cloud login state.' });
           return;
         }
         const verification = await verifyUserLoginStateCore(body);
@@ -1063,13 +1115,21 @@ async function createApp(options = {}) {
       }
       if (action === 'apply_user_operations') {
         const result = await withDb(db, async (db) => {
-          const permissions = req.auth.payload.permissions || {};
-          if (!permissions.manage_admin_updates) {
-            return { status: 403, body: { ok: false, message: 'Only admins can sync user login state.' } };
+          const permissions = requestPermissions(req);
+          const canAdmin = !!permissions.manage_admin_updates;
+          const canManager = !!permissions.manage_marketer_users;
+          if (!canAdmin && !canManager) {
+            return { status: 403, body: { ok: false, message: 'Only admins and managers can sync user login state.' } };
           }
           const userOps = normalizeUserOperations(body.user_operations || body.operations);
           if (!userOps.length) {
             return { status: 200, body: { ok: true, message: 'No user operations were supplied.', user_operations: { received: 0, applied: 0 } } };
+          }
+          if (!canAdmin) {
+            const restrictionMessage = managerUserOperationRestrictionMessage(userOps);
+            if (restrictionMessage) {
+              return { status: 403, body: { ok: false, message: restrictionMessage } };
+            }
           }
           const actor = { userId: req.auth.user.id, name: req.auth.user.displayName };
           userOps.forEach((op) => applyUserOperation(db, op, actor, logAudit));
