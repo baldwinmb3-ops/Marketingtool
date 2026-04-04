@@ -1,5 +1,3 @@
-const { newDb } = require('pg-mem');
-
 const { createApp } = require('./app.cjs');
 const { closePool } = require('./db.cjs');
 
@@ -41,6 +39,7 @@ function shouldUseMemoryFallback(error) {
 }
 
 function createMemoryFallbackPool() {
+  const { newDb } = require('pg-mem');
   const mem = newDb({ autoCreateForeignKeyIndices: true, noAstCoverageCheck: true });
   const pgAdapter = mem.adapters.createPg();
   return new pgAdapter.Pool();
