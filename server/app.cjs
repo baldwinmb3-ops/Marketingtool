@@ -111,6 +111,10 @@ async function createApp(options = {}) {
   const app = express();
   const db = options.db || createPoolFromEnv(options.dbOptions || {});
   const ownsDbPool = !options.db;
+  const runtimeInfo =
+    options.runtimeInfo && typeof options.runtimeInfo === 'object' && !Array.isArray(options.runtimeInfo)
+      ? options.runtimeInfo
+      : {};
   const sessionTtlMs = Math.max(60_000, toInt(process.env.APP_SESSION_TTL_MS, DEFAULT_SESSION_TTL_MS));
   const cookieSameSite = parseCookieSameSite(process.env.APP_COOKIE_SAME_SITE || 'lax');
   const cookieSecureFromEnv = String(process.env.APP_COOKIE_SECURE || '').trim().toLowerCase() === 'true';
@@ -125,6 +129,17 @@ async function createApp(options = {}) {
   }
 
   const appVersion = String(process.env.APP_VERSION || `dev-${Date.now()}`);
+
+  function runtimeSnapshot() {
+    const snapshot = {
+      mode: String(runtimeInfo.mode || (ownsDbPool ? 'postgres' : 'custom')).trim() || 'custom',
+      persistence: String(runtimeInfo.persistence || (ownsDbPool ? 'Postgres' : 'Custom')).trim() || 'Custom',
+      degraded: !!runtimeInfo.degraded,
+    };
+    if (runtimeInfo.reason) snapshot.reason = String(runtimeInfo.reason);
+    if (runtimeInfo.fallbackTriggeredAt) snapshot.fallbackTriggeredAt = String(runtimeInfo.fallbackTriggeredAt);
+    return snapshot;
+  }
 
   app.use(
     cors({
@@ -423,7 +438,7 @@ async function createApp(options = {}) {
   app.use(attachAuth);
 
   app.get('/api/health', (_req, res) => {
-    res.json({ ok: true, service: 'marketingtool-backend', at: nowIso() });
+    res.json({ ok: true, service: 'marketingtool-backend', at: nowIso(), version: appVersion, runtime: runtimeSnapshot() });
   });
 
   app.get('/api/users', requireSession, async (req, res, next) => {
@@ -448,7 +463,7 @@ async function createApp(options = {}) {
 
   app.get('/version.json', (_req, res) => {
     res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0');
-    res.json({ ok: true, version: appVersion, updatedAt: nowIso() });
+    res.json({ ok: true, version: appVersion, updatedAt: nowIso(), runtime: runtimeSnapshot() });
   });
 
   app.post('/api/auth/sign-in', async (req, res, next) => {
