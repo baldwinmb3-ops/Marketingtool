@@ -44,6 +44,12 @@ const {
 
 const SESSION_COOKIE = 'mt_session';
 const DEFAULT_SESSION_TTL_MS = 1000 * 60 * 60 * 12;
+const DEFAULT_CORS_ORIGIN_RULES = [
+  'http://localhost:4173',
+  'http://127.0.0.1:4173',
+  'https://marketingtool-mocha.vercel.app',
+  'https://marketingtool-mocha-*.vercel.app',
+];
 
 function extractSessionIdFromRequest(req) {
   const cookieSession = String((req.cookies && req.cookies[SESSION_COOKIE]) || '').trim();
@@ -77,6 +83,30 @@ function parseTrustProxy(value) {
   return String(value || '').trim();
 }
 
+function normalizeCorsOriginRule(value) {
+  return String(value || '').trim().replace(/\/+$/, '');
+}
+
+function parseCorsOriginRules(value) {
+  const source = String(value || '').trim();
+  const rawRules = source ? source.split(',') : DEFAULT_CORS_ORIGIN_RULES.slice();
+  return rawRules.map((item) => normalizeCorsOriginRule(item)).filter(Boolean);
+}
+
+function escapeRegExp(text) {
+  return String(text || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function corsOriginMatches(rule, origin) {
+  const normalizedRule = normalizeCorsOriginRule(rule);
+  const normalizedOrigin = normalizeCorsOriginRule(origin);
+  if (!normalizedRule || !normalizedOrigin) return false;
+  if (normalizedRule === '*') return true;
+  if (!normalizedRule.includes('*')) return normalizedRule === normalizedOrigin;
+  const pattern = `^${normalizedRule.split('*').map((part) => escapeRegExp(part)).join('.*')}$`;
+  return new RegExp(pattern, 'i').test(normalizedOrigin);
+}
+
 async function createApp(options = {}) {
   const app = express();
   const db = options.db || createPoolFromEnv(options.dbOptions || {});
@@ -86,10 +116,7 @@ async function createApp(options = {}) {
   const cookieSecureFromEnv = String(process.env.APP_COOKIE_SECURE || '').trim().toLowerCase() === 'true';
   const cookieSecure = cookieSameSite === 'none' ? true : cookieSecureFromEnv;
   const trustProxy = parseTrustProxy(process.env.APP_TRUST_PROXY);
-  const corsOrigins = String(process.env.APP_CORS_ORIGIN || 'http://localhost:4173')
-    .split(',')
-    .map((item) => item.trim())
-    .filter(Boolean);
+  const corsOrigins = parseCorsOriginRules(process.env.APP_CORS_ORIGIN);
   if (trustProxy !== null) {
     app.set('trust proxy', trustProxy);
   }
@@ -103,7 +130,7 @@ async function createApp(options = {}) {
     cors({
       credentials: true,
       origin(origin, callback) {
-        if (!origin || corsOrigins.includes('*') || corsOrigins.includes(origin)) {
+        if (!origin || corsOrigins.some((rule) => corsOriginMatches(rule, origin))) {
           callback(null, true);
           return;
         }
