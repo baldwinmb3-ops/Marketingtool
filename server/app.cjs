@@ -1,6 +1,7 @@
 const express = require('express');
 const cookieParser = require('cookie-parser');
 const cors = require('cors');
+const path = require('path');
 
 const {
   nowIso,
@@ -31,6 +32,7 @@ const {
   updateUserPassword,
 } = require('./db.cjs');
 const { deriveAccess, buildSessionPayload } = require('./authz.cjs');
+const { latestValidatedBackup } = require('./backup-safety.cjs');
 const {
   sanitizeCatalogPayload,
   recomputePricing,
@@ -125,10 +127,28 @@ async function createApp(options = {}) {
     app.set('trust proxy', trustProxy);
   }
   if (options.initializeDatabase !== false) {
-    await initDatabase(db, { seed: options.seedDatabase !== false });
+    const initOptions = Object.prototype.hasOwnProperty.call(options, 'seedDatabase')
+      ? { seed: options.seedDatabase }
+      : {};
+    await initDatabase(db, initOptions);
   }
 
   const appVersion = String(process.env.APP_VERSION || `dev-${Date.now()}`);
+
+  function latestLocalBackupSummary() {
+    try {
+      const latest = latestValidatedBackup(path.join(process.cwd(), 'backups', 'users'));
+      if (!latest) return null;
+      return {
+        exportedAt: String(latest.exportedAt || '').trim(),
+        validatedAt: String(latest.validatedAt || '').trim(),
+        file: String(latest.jsonPath || '').trim(),
+        counts: latest.counts || {},
+      };
+    } catch {
+      return null;
+    }
+  }
 
   function runtimeSnapshot() {
     const snapshot = {
@@ -138,6 +158,8 @@ async function createApp(options = {}) {
     };
     if (runtimeInfo.reason) snapshot.reason = String(runtimeInfo.reason);
     if (runtimeInfo.fallbackTriggeredAt) snapshot.fallbackTriggeredAt = String(runtimeInfo.fallbackTriggeredAt);
+    const latestBackup = latestLocalBackupSummary();
+    if (latestBackup) snapshot.latestBackup = latestBackup;
     return snapshot;
   }
 
@@ -493,7 +515,7 @@ async function createApp(options = {}) {
         });
       });
       const payload = buildSessionPayload(signIn.user, { activeRole: signIn.activeRole, createdAt: nowIso() });
-      res.json({ ok: true, message: signIn.body.message, session: payload, session_id: sessionId, session_transport: 'cookie_or_bearer' });
+      res.json({ ok: true, message: signIn.body.message, session: payload, session_id: sessionId, session_transport: 'cookie_or_bearer', session_ttl_ms: sessionTtlMs });
     } catch (error) {
       next(error);
     }
@@ -857,7 +879,7 @@ async function createApp(options = {}) {
         }
         const sessionId = await createSession(signIn.user.id, signIn.activeRole);
         setSessionCookie(res, sessionId);
-        res.status(200).json({ ok: true, hard_fail: false, message: signIn.body.message, session_id: sessionId, session_transport: 'cookie_or_bearer', user: { user_id: signIn.user.id, role: signIn.activeRole === 'admin' ? 'admin' : 'marketer', app_role: signIn.user.isAssistant ? 'assistant_admin' : signIn.user.role === 'admin' ? 'primary_admin' : 'marketer', status: signIn.user.status, force_password_reset: !!signIn.user.forcePasswordReset, first_name: signIn.user.firstName, last_name: signIn.user.lastName, display_name: signIn.user.displayName, work_email: signIn.user.email, wwid: signIn.user.wwid, cloud_account_state: 'ready', created_at: signIn.user.createdAt, updated_at: signIn.user.updatedAt } });
+        res.status(200).json({ ok: true, hard_fail: false, message: signIn.body.message, session_id: sessionId, session_transport: 'cookie_or_bearer', session_ttl_ms: sessionTtlMs, user: { user_id: signIn.user.id, role: signIn.activeRole === 'admin' ? 'admin' : 'marketer', app_role: signIn.user.isAssistant ? 'assistant_admin' : signIn.user.role === 'admin' ? 'primary_admin' : 'marketer', status: signIn.user.status, force_password_reset: !!signIn.user.forcePasswordReset, first_name: signIn.user.firstName, last_name: signIn.user.lastName, display_name: signIn.user.displayName, work_email: signIn.user.email, wwid: signIn.user.wwid, cloud_account_state: 'ready', created_at: signIn.user.createdAt, updated_at: signIn.user.updatedAt } });
         return;
       }
       if (action === 'auth_complete_password_reset') {
@@ -918,7 +940,7 @@ async function createApp(options = {}) {
         return;
       }
       if (!req.auth || !req.auth.payload || !req.auth.payload.isAuthenticated) {
-        res.status(401).json({ ok: false, configured: true, message: 'Sign in is required for this cloud action.' });
+        res.status(401).json({ ok: false, configured: true, code: 'UNAUTHORIZED', message: 'Sign in is required for this cloud action.' });
         return;
       }
       if (action === 'catalog_get_live' || action === 'catalog_get_stage') {
