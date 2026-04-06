@@ -879,8 +879,10 @@ async function createApp(options = {}) {
           return;
         }
         const sessionId = await createSession(signIn.user.id, signIn.activeRole);
+        const payload = buildSessionPayload(signIn.user, { activeRole: signIn.activeRole, createdAt: nowIso() });
+        const publicUser = payload && payload.user ? payload.user : null;
         setSessionCookie(res, sessionId);
-        res.status(200).json({ ok: true, hard_fail: false, message: signIn.body.message, session_id: sessionId, session_transport: 'cookie_or_bearer', session_ttl_ms: sessionTtlMs, user: { user_id: signIn.user.id, role: signIn.activeRole === 'admin' ? 'admin' : 'marketer', app_role: signIn.user.isAssistant ? 'assistant_admin' : signIn.user.role === 'admin' ? 'primary_admin' : 'marketer', status: signIn.user.status, force_password_reset: !!signIn.user.forcePasswordReset, first_name: signIn.user.firstName, last_name: signIn.user.lastName, display_name: signIn.user.displayName, work_email: signIn.user.email, wwid: signIn.user.wwid, cloud_account_state: 'ready', created_at: signIn.user.createdAt, updated_at: signIn.user.updatedAt } });
+        res.status(200).json({ ok: true, hard_fail: false, message: signIn.body.message, session_id: sessionId, session_transport: 'cookie_or_bearer', session_ttl_ms: sessionTtlMs, available_roles: Array.isArray(payload.availableRoles) ? payload.availableRoles : [], user: { user_id: signIn.user.id, role: signIn.activeRole === 'admin' ? 'admin' : 'marketer', app_role: signIn.user.isAssistant ? 'assistant_admin' : signIn.user.role === 'admin' ? 'primary_admin' : 'marketer', status: signIn.user.status, force_password_reset: !!signIn.user.forcePasswordReset, first_name: signIn.user.firstName, last_name: signIn.user.lastName, display_name: signIn.user.displayName, work_email: signIn.user.email, wwid: signIn.user.wwid, cloud_account_state: 'ready', created_at: signIn.user.createdAt, updated_at: signIn.user.updatedAt, can_access_marketer: !!(publicUser && publicUser.canAccessMarketer), can_access_admin: !!(publicUser && publicUser.canAccessAdmin), can_access_manager: !!(publicUser && publicUser.canAccessManager), manager_only: !!(publicUser && publicUser.managerOnly) } });
         return;
       }
       if (action === 'auth_complete_password_reset') {
@@ -919,9 +921,12 @@ async function createApp(options = {}) {
           updated_at: updatedAt,
         };
         const user = mapUserToState(updatedRow);
+        const payload = buildSessionPayload(user, { activeRole: role, createdAt: nowIso() });
+        const publicUser = payload && payload.user ? payload.user : null;
         res.status(200).json({
           ok: true,
           message: 'Password updated.',
+          available_roles: Array.isArray(payload.availableRoles) ? payload.availableRoles : [],
           user: {
             user_id: user.id,
             role,
@@ -936,6 +941,10 @@ async function createApp(options = {}) {
             cloud_account_state: 'ready',
             created_at: user.createdAt,
             updated_at: user.updatedAt,
+            can_access_marketer: !!(publicUser && publicUser.canAccessMarketer),
+            can_access_admin: !!(publicUser && publicUser.canAccessAdmin),
+            can_access_manager: !!(publicUser && publicUser.canAccessManager),
+            manager_only: !!(publicUser && publicUser.managerOnly),
           },
         });
         return;
