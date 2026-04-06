@@ -198,8 +198,23 @@ function normalizeDepartmentIds(value, fallback = []) {
 
 function applyUserOperation(db, op, actor, logAudit) {
   const users = Array.isArray(db.users) ? db.users : [];
-  const existing = users.find((entry) => normalizeWwid(entry.wwid) === op.wwid);
   const meta = op.metadata && typeof op.metadata === 'object' ? op.metadata : {};
+  const metaBool = (value, fallback = false) => {
+    if (typeof value === 'boolean') return value;
+    const raw = String(value ?? '').trim().toLowerCase();
+    if (!raw) return !!fallback;
+    if (['1', 'true', 'yes', 'y', 'on', 'active'].includes(raw)) return true;
+    if (['0', 'false', 'no', 'n', 'off', 'inactive'].includes(raw)) return false;
+    return !!fallback;
+  };
+  const localUserId = String(meta.local_user_id ?? meta.localUserId ?? '').trim();
+  const previousWwid = normalizeWwid(meta.previous_wwid ?? meta.previousWwid ?? '');
+  const existing = users.find((entry) => {
+    if (!entry || typeof entry !== 'object') return false;
+    if (localUserId && String(entry.id || '').trim() === localUserId) return true;
+    const entryWwid = normalizeWwid(entry.wwid);
+    return entryWwid === op.wwid || (!!previousWwid && entryWwid === previousWwid);
+  });
   const now = nowIso();
   const forceResetExplicit = typeof op.forcePasswordReset === 'boolean' ? op.forcePasswordReset : null;
   const shouldForceResetFromMeta = !!meta.temp_password;
@@ -208,27 +223,27 @@ function applyUserOperation(db, op, actor, logAudit) {
     if (op.role === 'primary_admin') {
       target.role = 'admin';
       target.isAssistant = false;
-      target.canAccessMarketer = true;
+      target.canAccessMarketer = metaBool(meta.can_access_marketer ?? meta.allow_marketer_mode, false);
       target.canAccessAdmin = false;
-      target.canAccessManager = true;
+      target.canAccessManager = metaBool(meta.can_access_manager ?? meta.allow_manager_mode, false);
       target.managerOnly = false;
       return;
     }
     if (op.role === 'assistant_admin') {
       target.role = 'admin';
       target.isAssistant = true;
-      target.canAccessMarketer = true;
+      target.canAccessMarketer = metaBool(meta.can_access_marketer ?? meta.allow_marketer_mode, false);
       target.canAccessAdmin = false;
-      target.canAccessManager = true;
+      target.canAccessManager = metaBool(meta.can_access_manager ?? meta.allow_manager_mode, false);
       target.managerOnly = false;
       return;
     }
     target.role = 'marketer';
     target.isAssistant = false;
     target.canAccessMarketer = false;
-    target.canAccessAdmin = !!meta.can_access_admin;
-    target.canAccessManager = !!meta.can_access_manager;
-    target.managerOnly = !!meta.manager_only;
+    target.canAccessAdmin = metaBool(meta.can_access_admin ?? meta.allow_admin_mode, false);
+    target.canAccessManager = metaBool(meta.can_access_manager ?? meta.allow_manager_mode, false);
+    target.managerOnly = metaBool(meta.manager_only, false);
   }
 
   function applyDepartments(target) {
@@ -242,6 +257,7 @@ function applyUserOperation(db, op, actor, logAudit) {
     target.lastName = String(meta.last_name || target.lastName || '').trim();
     target.displayName = String(op.displayName || meta.display_name || target.displayName || '').trim() || `${target.firstName} ${target.lastName}`.trim() || 'User';
     target.email = normalizeEmail(meta.work_email || meta.email || target.email || `${op.wwid.toLowerCase()}@example.local`);
+    target.phone = String(meta.phone || target.phone || '').trim();
     target.passwordHash = hashPassword(String(meta.temp_password || 'Temp123A'));
     applyRole(target);
     applyDepartments(target);
@@ -257,10 +273,12 @@ function applyUserOperation(db, op, actor, logAudit) {
 
   if (op.op === 'update_user') {
     applyRole(existing);
-    if (meta.first_name) existing.firstName = String(meta.first_name).trim();
-    if (meta.last_name) existing.lastName = String(meta.last_name).trim();
-    if (meta.work_email || meta.email) existing.email = normalizeEmail(meta.work_email || meta.email);
-    if (op.displayName || meta.display_name) existing.displayName = String(op.displayName || meta.display_name).trim();
+    existing.wwid = op.wwid;
+    if (Object.prototype.hasOwnProperty.call(meta, 'first_name')) existing.firstName = String(meta.first_name || '').trim();
+    if (Object.prototype.hasOwnProperty.call(meta, 'last_name')) existing.lastName = String(meta.last_name || '').trim();
+    if (Object.prototype.hasOwnProperty.call(meta, 'work_email') || Object.prototype.hasOwnProperty.call(meta, 'email')) existing.email = normalizeEmail(meta.work_email || meta.email);
+    if (Object.prototype.hasOwnProperty.call(meta, 'phone')) existing.phone = String(meta.phone || '').trim();
+    if (op.displayName || Object.prototype.hasOwnProperty.call(meta, 'display_name')) existing.displayName = String(op.displayName || meta.display_name || `${existing.firstName || ''} ${existing.lastName || ''}`).trim();
     if (meta.temp_password) existing.passwordHash = hashPassword(String(meta.temp_password));
     applyDepartments(existing);
     existing.forcePasswordReset = forceResetExplicit !== null ? forceResetExplicit : shouldForceResetFromMeta ? true : existing.forcePasswordReset;

@@ -471,6 +471,7 @@ function mapUserToState(row) {
     lastName: String(row.last_name || '').trim(),
     wwid: String(row.wwid || ''),
     email: String(row.email || '').trim().toLowerCase(),
+    phone: String(row.phone || '').trim(),
     role: String(row.role || 'marketer'),
     isAssistant: toBool(row.is_assistant, false),
     canAccessMarketer: toBool(row.can_access_marketer, false),
@@ -639,13 +640,13 @@ async function upsertUserRow(client, user) {
   const row = user && typeof user === 'object' ? user : {};
   await client.query(
     `INSERT INTO users (
-      id, display_name, first_name, last_name, wwid, email, role,
+      id, display_name, first_name, last_name, wwid, email, phone, role,
       is_assistant, can_access_marketer, can_access_admin, can_access_manager, manager_only,
       department_ids, status, is_locked, password_hash, force_password_reset, created_at, updated_at
     ) VALUES (
-      $1,$2,$3,$4,$5,$6,$7,
-      $8,$9,$10,$11,$12,
-      $13,$14,$15,$16,$17,$18,$19
+      $1,$2,$3,$4,$5,$6,$7,$8,
+      $9,$10,$11,$12,$13,
+      $14,$15,$16,$17,$18,$19,$20
     )
     ON CONFLICT (id) DO UPDATE SET
       display_name = EXCLUDED.display_name,
@@ -653,6 +654,7 @@ async function upsertUserRow(client, user) {
       last_name = EXCLUDED.last_name,
       wwid = EXCLUDED.wwid,
       email = EXCLUDED.email,
+      phone = EXCLUDED.phone,
       role = EXCLUDED.role,
       is_assistant = EXCLUDED.is_assistant,
       can_access_marketer = EXCLUDED.can_access_marketer,
@@ -672,6 +674,7 @@ async function upsertUserRow(client, user) {
       String(row.lastName || '').trim(),
       normalizeWwid(row.wwid),
       normalizeEmail(row.email),
+      String(row.phone || '').trim(),
       normalizeRole(row.role) || 'marketer',
       !!row.isAssistant,
       !!row.canAccessMarketer,

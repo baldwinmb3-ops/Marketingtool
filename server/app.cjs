@@ -265,6 +265,7 @@ async function createApp(options = {}) {
       wwid: String(user.wwid || '').trim(),
       workEmail: String(user.email || '').trim().toLowerCase(),
       emailOrLogin: String(user.email || '').trim().toLowerCase(),
+      phoneNumber: String(user.phoneNumber || user.phone || '').trim(),
       role: normalizedRole,
       isAssistant: !!user.isAssistant,
       canAccessMarketer: !!user.canAccessMarketer,
