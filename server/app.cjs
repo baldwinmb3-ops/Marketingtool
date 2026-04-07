@@ -371,6 +371,89 @@ async function createApp(options = {}) {
     return { status: 200, body: { ok: true, message: `Signed in as ${activeRole}.` }, user, activeRole };
   }
 
+  async function switchSessionRoleCore(req, requestedRole) {
+    const nextRole = normalizeRole(requestedRole);
+    if (!nextRole) {
+      return {
+        status: 400,
+        body: { ok: false, message: 'Role is required.' },
+        user: null,
+        sessionId: '',
+        payload: buildSessionPayload(null, null),
+      };
+    }
+    const currentSession = req && req.auth && req.auth.session ? req.auth.session : null;
+    const currentUser = req && req.auth && req.auth.user ? req.auth.user : null;
+    if (!currentSession || !currentUser) {
+      return {
+        status: 401,
+        body: { ok: false, message: 'Sign in is required.' },
+        user: null,
+        sessionId: '',
+        payload: buildSessionPayload(null, null),
+      };
+    }
+
+    const identifiers = [
+      normalizeIdentifier(currentUser.email || ''),
+      normalizeIdentifier(currentUser.wwid || ''),
+      normalizeIdentifier(req && req.body && req.body.identifier),
+    ].filter(Boolean);
+
+    let targetRow = null;
+    for (const identifier of identifiers) {
+      targetRow = await findUserRowByIdentifier(db, identifier, nextRole);
+      if (targetRow) break;
+    }
+
+    let targetUser = targetRow ? mapUserToState(targetRow) : null;
+    if (!targetUser) {
+      const currentAccess = deriveAccess(currentUser);
+      if (Array.isArray(currentAccess.availableRoles) && currentAccess.availableRoles.includes(nextRole)) {
+        targetUser = currentUser;
+      }
+    }
+    if (!targetUser) {
+      return {
+        status: 403,
+        body: { ok: false, message: `This account cannot switch to ${nextRole}.` },
+        user: null,
+        sessionId: '',
+        payload: buildSessionPayload(null, null),
+      };
+    }
+
+    const access = deriveAccess(targetUser);
+    if (!Array.isArray(access.availableRoles) || !access.availableRoles.includes(nextRole)) {
+      return {
+        status: 403,
+        body: { ok: false, message: `This account cannot switch to ${nextRole}.` },
+        user: null,
+        sessionId: '',
+        payload: buildSessionPayload(null, null),
+      };
+    }
+
+    const sessionId = await createSession(targetUser.id, nextRole);
+    await destroySession(currentSession.id);
+    const payload = buildSessionPayload(targetUser, { activeRole: nextRole, createdAt: nowIso() });
+    return {
+      status: 200,
+      body: {
+        ok: true,
+        message: `Switched to ${nextRole}.`,
+        session: payload,
+        session_id: sessionId,
+        session_transport: 'cookie_or_bearer',
+        session_ttl_ms: sessionTtlMs,
+        available_roles: Array.isArray(payload.availableRoles) ? payload.availableRoles : [],
+      },
+      user: targetUser,
+      sessionId,
+      payload,
+    };
+  }
+
   async function verifyUserLoginStateCore(input = {}) {
     const src = input && typeof input === 'object' ? input : {};
     const requestedRole = normalizeRole(src.role) || 'marketer';
@@ -516,7 +599,7 @@ async function createApp(options = {}) {
         });
       });
       const payload = buildSessionPayload(signIn.user, { activeRole: signIn.activeRole, createdAt: nowIso() });
-      res.json({ ok: true, message: signIn.body.message, session: payload, session_id: sessionId, session_transport: 'cookie_or_bearer', session_ttl_ms: sessionTtlMs });
+      res.json({ ok: true, message: signIn.body.message, session: payload, permissions: payload.permissions, session_id: sessionId, session_transport: 'cookie_or_bearer', session_ttl_ms: sessionTtlMs });
     } catch (error) {
       next(error);
     }
@@ -528,6 +611,29 @@ async function createApp(options = {}) {
       return;
     }
     res.json({ ok: true, session: req.auth.payload });
+  });
+
+  app.post('/api/auth/switch-role', requireSession, async (req, res, next) => {
+    try {
+      const requestedRole = normalizeRole(req.body && req.body.role);
+      const result = await switchSessionRoleCore(req, requestedRole);
+      if (result.sessionId) setSessionCookie(res, result.sessionId);
+      if (result.status === 200 && result.user) {
+        await withDb(db, async (state) => {
+          logAudit(state, {
+            action: 'auth.switch_role',
+            actorUserId: result.user.id,
+            actorName: result.user.displayName,
+            targetType: 'session',
+            targetId: result.sessionId,
+            details: { activeRole: requestedRole },
+          });
+        });
+      }
+      res.status(result.status).json(result.body);
+    } catch (error) {
+      next(error);
+    }
   });
 
   async function handleSignOut(req, res) {
@@ -882,7 +988,7 @@ async function createApp(options = {}) {
         const payload = buildSessionPayload(signIn.user, { activeRole: signIn.activeRole, createdAt: nowIso() });
         const publicUser = payload && payload.user ? payload.user : null;
         setSessionCookie(res, sessionId);
-        res.status(200).json({ ok: true, hard_fail: false, message: signIn.body.message, session_id: sessionId, session_transport: 'cookie_or_bearer', session_ttl_ms: sessionTtlMs, available_roles: Array.isArray(payload.availableRoles) ? payload.availableRoles : [], user: { user_id: signIn.user.id, role: signIn.activeRole === 'admin' ? 'admin' : 'marketer', app_role: signIn.user.isAssistant ? 'assistant_admin' : signIn.user.role === 'admin' ? 'primary_admin' : 'marketer', status: signIn.user.status, force_password_reset: !!signIn.user.forcePasswordReset, first_name: signIn.user.firstName, last_name: signIn.user.lastName, display_name: signIn.user.displayName, work_email: signIn.user.email, wwid: signIn.user.wwid, cloud_account_state: 'ready', created_at: signIn.user.createdAt, updated_at: signIn.user.updatedAt, can_access_marketer: !!(publicUser && publicUser.canAccessMarketer), can_access_admin: !!(publicUser && publicUser.canAccessAdmin), can_access_manager: !!(publicUser && publicUser.canAccessManager), manager_only: !!(publicUser && publicUser.managerOnly) } });
+        res.status(200).json({ ok: true, hard_fail: false, message: signIn.body.message, permissions: payload.permissions, session_id: sessionId, session_transport: 'cookie_or_bearer', session_ttl_ms: sessionTtlMs, available_roles: Array.isArray(payload.availableRoles) ? payload.availableRoles : [], user: { user_id: signIn.user.id, role: signIn.activeRole === 'admin' ? 'admin' : 'marketer', app_role: signIn.user.isAssistant ? 'assistant_admin' : signIn.user.role === 'admin' ? 'primary_admin' : 'marketer', status: signIn.user.status, force_password_reset: !!signIn.user.forcePasswordReset, first_name: signIn.user.firstName, last_name: signIn.user.lastName, display_name: signIn.user.displayName, work_email: signIn.user.email, wwid: signIn.user.wwid, cloud_account_state: 'ready', created_at: signIn.user.createdAt, updated_at: signIn.user.updatedAt, can_access_marketer: !!(publicUser && publicUser.canAccessMarketer), can_access_admin: !!(publicUser && publicUser.canAccessAdmin), can_access_manager: !!(publicUser && publicUser.canAccessManager), manager_only: !!(publicUser && publicUser.managerOnly) } });
         return;
       }
       if (action === 'auth_complete_password_reset') {
@@ -926,6 +1032,7 @@ async function createApp(options = {}) {
         res.status(200).json({
           ok: true,
           message: 'Password updated.',
+          permissions: payload.permissions,
           available_roles: Array.isArray(payload.availableRoles) ? payload.availableRoles : [],
           user: {
             user_id: user.id,
@@ -951,6 +1058,25 @@ async function createApp(options = {}) {
       }
       if (!req.auth || !req.auth.payload || !req.auth.payload.isAuthenticated) {
         res.status(401).json({ ok: false, configured: true, code: 'UNAUTHORIZED', message: 'Sign in is required for this cloud action.' });
+        return;
+      }
+      if (action === 'auth_switch_role') {
+        const requestedRole = normalizeRole(body.role);
+        const result = await switchSessionRoleCore(req, requestedRole);
+        if (result.sessionId) setSessionCookie(res, result.sessionId);
+        if (result.status === 200 && result.user) {
+          await withDb(db, async (state) => {
+            logAudit(state, {
+              action: 'auth.switch_role',
+              actorUserId: result.user.id,
+              actorName: result.user.displayName,
+              targetType: 'session',
+              targetId: result.sessionId,
+              details: { activeRole: requestedRole, source: 'cloud' },
+            });
+          });
+        }
+        res.status(result.status).json(result.body);
         return;
       }
       if (action === 'catalog_get_live' || action === 'catalog_get_stage') {

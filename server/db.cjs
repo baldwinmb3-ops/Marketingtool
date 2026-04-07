@@ -11,6 +11,7 @@ const {
   hashPassword,
   randomId,
 } = require('./lib.cjs');
+const { shouldSeedOnBoot } = require('./db-safety.cjs');
 
 const MIGRATION_SQL_PATH = path.join(__dirname, 'sql', '001_init.sql');
 const MIGRATION_SQL = fs.readFileSync(MIGRATION_SQL_PATH, 'utf8');
@@ -929,7 +930,7 @@ async function seedDatabase(pool, options = {}) {
 
 async function initDatabase(pool, options = {}) {
   await migrateDatabase(pool);
-  if (options.seed === false) return;
+  if (!shouldSeedOnBoot(options.seed)) return;
   await seedDatabase(pool, { force: false });
 }
 
@@ -1111,5 +1112,6 @@ module.exports = {
   getSessionRecord,
   revokeSessionRecord,
   updateUserPassword,
+  upsertUserRow,
   closePool,
 };
