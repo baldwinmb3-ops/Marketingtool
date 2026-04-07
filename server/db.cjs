@@ -1082,6 +1082,31 @@ async function getSessionRecord(pool, sessionId, options = {}) {
   };
 }
 
+async function updateSessionRecordRole(pool, sessionId, activeRole) {
+  const id = String(sessionId || '').trim();
+  const nextRole = normalizeRole(activeRole) || null;
+  if (!id || !nextRole) return null;
+  const updatedAt = nowIso();
+  const result = await pool.query(
+    `UPDATE sessions
+     SET active_role = $2,
+         last_seen_at = $3
+     WHERE id = $1
+       AND revoked_at IS NULL
+     RETURNING id, user_id, active_role, created_at, expires_at`,
+    [id, nextRole, updatedAt],
+  );
+  const row = result.rows[0];
+  if (!row) return null;
+  return {
+    id: String(row.id || ''),
+    userId: String(row.user_id || ''),
+    activeRole: normalizeRole(row.active_role) || 'marketer',
+    createdAt: toIso(row.created_at),
+    expiresAt: toIso(row.expires_at),
+  };
+}
+
 async function revokeSessionRecord(pool, sessionId) {
   const id = String(sessionId || '').trim();
   if (!id) return;
@@ -1110,6 +1135,7 @@ module.exports = {
   logBookingEvent,
   createSessionRecord,
   getSessionRecord,
+  updateSessionRecordRole,
   revokeSessionRecord,
   updateUserPassword,
   upsertUserRow,

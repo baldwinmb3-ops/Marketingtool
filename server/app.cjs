@@ -28,6 +28,7 @@ const {
   logBookingEvent,
   createSessionRecord,
   getSessionRecord,
+  updateSessionRecordRole,
   revokeSessionRecord,
   updateUserPassword,
 } = require('./db.cjs');
@@ -434,9 +435,18 @@ async function createApp(options = {}) {
       };
     }
 
-    const sessionId = await createSession(targetUser.id, nextRole);
-    await destroySession(currentSession.id);
-    const payload = buildSessionPayload(targetUser, { activeRole: nextRole, createdAt: nowIso() });
+    const updatedSession = await updateSessionRecordRole(db, currentSession.id, nextRole);
+    if (!updatedSession) {
+      return {
+        status: 401,
+        body: { ok: false, message: 'Sign in is required.' },
+        user: null,
+        sessionId: '',
+        payload: buildSessionPayload(null, null),
+      };
+    }
+    const sessionId = String(updatedSession.id || currentSession.id || '').trim();
+    const payload = buildSessionPayload(targetUser, { activeRole: nextRole, createdAt: updatedSession.createdAt || currentSession.createdAt || nowIso() });
     return {
       status: 200,
       body: {
