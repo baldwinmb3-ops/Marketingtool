@@ -4,6 +4,7 @@ const { Pool } = require('pg');
 const {
   nowIso,
   normalizeRole,
+  normalizeManagerTitle,
   normalizeStatus,
   normalizeWwid,
   normalizeEmail,
@@ -183,6 +184,7 @@ function createSeedUsers() {
       canAccessMarketer: true,
       canAccessAdmin: false,
       canAccessManager: true,
+      managerTitle: 'Manager',
       managerOnly: false,
       status: 'active',
       isLocked: false,
@@ -203,6 +205,7 @@ function createSeedUsers() {
       canAccessMarketer: true,
       canAccessAdmin: false,
       canAccessManager: true,
+      managerTitle: 'Manager',
       managerOnly: false,
       status: 'active',
       isLocked: false,
@@ -223,6 +226,7 @@ function createSeedUsers() {
       canAccessMarketer: false,
       canAccessAdmin: false,
       canAccessManager: false,
+      managerTitle: '',
       managerOnly: false,
       departmentIds: ['manager-cat-stores'],
       status: 'active',
@@ -244,6 +248,7 @@ function createSeedUsers() {
       canAccessMarketer: false,
       canAccessAdmin: false,
       canAccessManager: false,
+      managerTitle: '',
       managerOnly: false,
       departmentIds: ['manager-cat-hotels'],
       status: 'active',
@@ -265,6 +270,7 @@ function createSeedUsers() {
       canAccessMarketer: false,
       canAccessAdmin: false,
       canAccessManager: true,
+      managerTitle: 'Manager',
       managerOnly: true,
       departmentIds: ['manager-cat-stores'],
       status: 'active',
@@ -286,6 +292,7 @@ function createSeedUsers() {
       canAccessMarketer: false,
       canAccessAdmin: true,
       canAccessManager: true,
+      managerTitle: 'Manager',
       managerOnly: false,
       departmentIds: ['manager-cat-hotels'],
       status: 'active',
@@ -478,6 +485,7 @@ function mapUserToState(row) {
     canAccessMarketer: toBool(row.can_access_marketer, false),
     canAccessAdmin: toBool(row.can_access_admin, false),
     canAccessManager: toBool(row.can_access_manager, false),
+    managerTitle: normalizeManagerTitle(row.manager_title, ''),
     managerOnly: toBool(row.manager_only, false),
     departmentIds: normalizeDepartmentIds(row.department_ids),
     status: String(row.status || 'active'),
@@ -549,6 +557,20 @@ async function listUsers(pool) {
   } finally {
     client.release();
   }
+}
+
+async function listOnDutyManagerUsers(pool) {
+  const result = await pool.query(
+    `SELECT DISTINCT u.*
+     FROM sessions s
+     JOIN users u ON u.id = s.user_id
+     WHERE s.revoked_at IS NULL
+       AND s.expires_at > NOW()
+       AND COALESCE(s.manager_on_duty, FALSE) = TRUE
+       AND COALESCE(u.status, 'active') = 'active'
+     ORDER BY u.display_name ASC, u.created_at ASC`,
+  );
+  return result.rows.map(mapUserToState);
 }
 
 async function updateUserPassword(pool, userId, passwordHash, forcePasswordReset = false, updatedAt = nowIso()) {
@@ -642,12 +664,12 @@ async function upsertUserRow(client, user) {
   await client.query(
     `INSERT INTO users (
       id, display_name, first_name, last_name, wwid, email, phone, role,
-      is_assistant, can_access_marketer, can_access_admin, can_access_manager, manager_only,
+      is_assistant, can_access_marketer, can_access_admin, can_access_manager, manager_title, manager_only,
       department_ids, status, is_locked, password_hash, force_password_reset, created_at, updated_at
     ) VALUES (
       $1,$2,$3,$4,$5,$6,$7,$8,
-      $9,$10,$11,$12,$13,
-      $14,$15,$16,$17,$18,$19,$20
+      $9,$10,$11,$12,$13,$14,
+      $15,$16,$17,$18,$19,$20,$21
     )
     ON CONFLICT (id) DO UPDATE SET
       display_name = EXCLUDED.display_name,
@@ -661,6 +683,7 @@ async function upsertUserRow(client, user) {
       can_access_marketer = EXCLUDED.can_access_marketer,
       can_access_admin = EXCLUDED.can_access_admin,
       can_access_manager = EXCLUDED.can_access_manager,
+      manager_title = EXCLUDED.manager_title,
       manager_only = EXCLUDED.manager_only,
       department_ids = EXCLUDED.department_ids,
       status = EXCLUDED.status,
@@ -681,6 +704,7 @@ async function upsertUserRow(client, user) {
       !!row.canAccessMarketer,
       !!row.canAccessAdmin,
       !!row.canAccessManager,
+      normalizeManagerTitle(row.managerTitle, ''),
       !!row.managerOnly,
       JSON.stringify(normalizeDepartmentIds(row.departmentIds)),
       normalizeStatus(row.status),
@@ -701,7 +725,14 @@ async function persistDbInternal(client, db) {
   const history = Array.isArray(snapshots.history) ? snapshots.history : [];
   const draft = snapshots.draft && typeof snapshots.draft === 'object' ? snapshots.draft : null;
   const bookings = Array.isArray(state.bookings) ? state.bookings : [];
-  const bookingEvents = Array.isArray(state.bookingEvents) ? state.bookingEvents : [];
+  const bookingIdSet = new Set(
+    bookings
+      .map((row) => String(row && row.id ? row.id : '').trim())
+      .filter(Boolean),
+  );
+  const bookingEvents = Array.isArray(state.bookingEvents)
+    ? state.bookingEvents.filter((entry) => bookingIdSet.has(String(entry && entry.bookingId ? entry.bookingId : '').trim()))
+    : [];
   const audit = Array.isArray(state.audit) ? state.audit : [];
 
   for (const user of users) {
@@ -1030,6 +1061,9 @@ async function createSessionRecord(pool, options = {}) {
   const userId = String(options.userId || '').trim();
   if (!userId) throw new Error('userId is required');
   const activeRole = normalizeRole(options.activeRole) || 'marketer';
+  const managerOnDuty = Object.prototype.hasOwnProperty.call(options, 'managerOnDuty')
+    ? !!options.managerOnDuty
+    : activeRole === 'manager';
   const ttlMs = Math.max(60_000, Number.parseInt(String(options.ttlMs || 0), 10) || 1000 * 60 * 60 * 12);
   const createdAt = nowIso();
   const expiresAt = new Date(Date.now() + ttlMs).toISOString();
@@ -1037,11 +1071,11 @@ async function createSessionRecord(pool, options = {}) {
 
   await pool.query(
     `INSERT INTO sessions (
-      id, user_id, active_role, created_at, expires_at, last_seen_at, revoked_at
-    ) VALUES ($1,$2,$3,$4,$5,$6,NULL)`,
-    [id, userId, activeRole, createdAt, expiresAt, createdAt],
+      id, user_id, active_role, manager_on_duty, created_at, expires_at, last_seen_at, revoked_at
+    ) VALUES ($1,$2,$3,$4,$5,$6,$7,NULL)`,
+    [id, userId, activeRole, managerOnDuty, createdAt, expiresAt, createdAt],
   );
-  return { id, userId, activeRole, createdAt, expiresAt };
+  return { id, userId, activeRole, managerOnDuty, createdAt, expiresAt };
 }
 
 async function getSessionRecord(pool, sessionId, options = {}) {
@@ -1053,6 +1087,7 @@ async function getSessionRecord(pool, sessionId, options = {}) {
       s.id AS session_id,
       s.user_id AS session_user_id,
       s.active_role AS session_active_role,
+      s.manager_on_duty AS session_manager_on_duty,
       s.created_at AS session_created_at,
       s.expires_at AS session_expires_at,
       u.*
@@ -1076,6 +1111,7 @@ async function getSessionRecord(pool, sessionId, options = {}) {
     id: String(row.session_id || ''),
     userId: String(row.session_user_id || ''),
     activeRole: normalizeRole(row.session_active_role) || 'marketer',
+    managerOnDuty: toBool(row.session_manager_on_duty, false),
     createdAt: toIso(row.session_created_at),
     expiresAt: toIso(nextExpiresAt),
     user: mapUserToState(row),
@@ -1087,14 +1123,16 @@ async function updateSessionRecordRole(pool, sessionId, activeRole) {
   const nextRole = normalizeRole(activeRole) || null;
   if (!id || !nextRole) return null;
   const updatedAt = nowIso();
+  const managerOnDuty = nextRole === 'manager';
   const result = await pool.query(
     `UPDATE sessions
      SET active_role = $2,
-         last_seen_at = $3
+         manager_on_duty = $3,
+         last_seen_at = $4
      WHERE id = $1
        AND revoked_at IS NULL
-     RETURNING id, user_id, active_role, created_at, expires_at`,
-    [id, nextRole, updatedAt],
+     RETURNING id, user_id, active_role, manager_on_duty, created_at, expires_at`,
+    [id, nextRole, managerOnDuty, updatedAt],
   );
   const row = result.rows[0];
   if (!row) return null;
@@ -1102,6 +1140,34 @@ async function updateSessionRecordRole(pool, sessionId, activeRole) {
     id: String(row.id || ''),
     userId: String(row.user_id || ''),
     activeRole: normalizeRole(row.active_role) || 'marketer',
+    managerOnDuty: toBool(row.manager_on_duty, false),
+    createdAt: toIso(row.created_at),
+    expiresAt: toIso(row.expires_at),
+  };
+}
+
+async function updateSessionDutyStatus(pool, sessionId, managerOnDuty) {
+  const id = String(sessionId || '').trim();
+  if (!id) return null;
+  const nextDuty = !!managerOnDuty;
+  const updatedAt = nowIso();
+  const result = await pool.query(
+    `UPDATE sessions
+     SET manager_on_duty = $2,
+         last_seen_at = $3
+     WHERE id = $1
+       AND revoked_at IS NULL
+       AND expires_at > NOW()
+     RETURNING id, user_id, active_role, manager_on_duty, created_at, expires_at`,
+    [id, nextDuty, updatedAt],
+  );
+  const row = result.rows[0];
+  if (!row) return null;
+  return {
+    id: String(row.id || ''),
+    userId: String(row.user_id || ''),
+    activeRole: normalizeRole(row.active_role) || 'marketer',
+    managerOnDuty: toBool(row.manager_on_duty, false),
     createdAt: toIso(row.created_at),
     expiresAt: toIso(row.expires_at),
   };
@@ -1130,12 +1196,14 @@ module.exports = {
   findUserByIdentifier,
   findUserRowByIdentifier,
   listUsers,
+  listOnDutyManagerUsers,
   mapUserToState,
   logAudit,
   logBookingEvent,
   createSessionRecord,
   getSessionRecord,
   updateSessionRecordRole,
+  updateSessionDutyStatus,
   revokeSessionRecord,
   updateUserPassword,
   upsertUserRow,

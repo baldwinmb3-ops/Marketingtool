@@ -4,6 +4,7 @@ const {
   toNum,
   normalizeStatus,
   normalizeAppRole,
+  normalizeManagerTitle,
   normalizeWwid,
   normalizeEmail,
   randomId,
@@ -130,6 +131,115 @@ function sanitizeBookingRow(input, defaults = {}) {
   };
 }
 
+function bookingDebugLogsEnabled() {
+  return String(process.env.BOOKING_DEBUG_LOGS || '').trim() === '1';
+}
+
+function bookingDebugLog(kind, payload) {
+  if (!bookingDebugLogsEnabled()) return;
+  try {
+    console.error(`[BOOKING_DEBUG_BACKEND] ${String(kind || 'booking-debug')}`, JSON.stringify(payload, null, 2));
+  } catch (err) {
+    console.error(`[BOOKING_DEBUG_BACKEND] ${String(kind || 'booking-debug')}`, String((err && err.message) || err || 'log-failed'));
+  }
+}
+
+function bookingValidationDiagnostics(rawRequest, row, serverVersion, publishedPayload) {
+  const raw = rawRequest && typeof rawRequest === 'object' ? rawRequest : {};
+  const issues = [];
+  const missingFields = [];
+  const invalidFields = [];
+  const rawSnapshotVersion = raw.snapshotVersion ?? raw.snapshot_version;
+  const rawQuoteLines = Array.isArray(raw.quoteLines)
+    ? raw.quoteLines
+    : Array.isArray(raw.quote_lines)
+      ? raw.quote_lines
+      : null;
+
+  if (rawSnapshotVersion === undefined || rawSnapshotVersion === null || String(rawSnapshotVersion).trim() === '') {
+    missingFields.push('snapshotVersion');
+    issues.push({ field: 'snapshotVersion', reason: 'missing', message: 'snapshotVersion is required.' });
+  } else {
+    const parsedSnapshotVersion = toInt(rawSnapshotVersion, NaN);
+    if (!Number.isFinite(parsedSnapshotVersion) || parsedSnapshotVersion <= 0) {
+      invalidFields.push('snapshotVersion');
+      issues.push({ field: 'snapshotVersion', reason: 'invalid', message: `snapshotVersion must be a positive integer. Received=${String(rawSnapshotVersion)}.` });
+    } else if (row.snapshotVersion !== serverVersion) {
+      invalidFields.push('snapshotVersion');
+      issues.push({ field: 'snapshotVersion', reason: 'stale', message: `Snapshot version mismatch. Device=${row.snapshotVersion}, server=${serverVersion}.` });
+    }
+  }
+
+  if (!rawQuoteLines) {
+    missingFields.push('quoteLines');
+    issues.push({ field: 'quoteLines', reason: 'missing', message: 'quoteLines is required.' });
+  } else if (!rawQuoteLines.length) {
+    invalidFields.push('quoteLines');
+    issues.push({ field: 'quoteLines', reason: 'empty', message: 'quoteLines must contain at least one ticket line.' });
+  } else {
+    rawQuoteLines.forEach((line, index) => {
+      const rawLine = line && typeof line === 'object' ? line : null;
+      const prefix = `quoteLines[${index}]`;
+      if (!rawLine) {
+        invalidFields.push(prefix);
+        issues.push({ field: prefix, reason: 'invalid', message: 'quote line must be an object.' });
+        return;
+      }
+      const ticketLineId = String(rawLine.ticketLineId || rawLine.ticket_line_id || '').trim();
+      const qty = toInt(rawLine.qty, NaN);
+      const freeQty = toInt(rawLine.freeQty ?? rawLine.free_qty, 0);
+      const extraEach = toNum(rawLine.extraEach ?? rawLine.extra_each, 0);
+      if (!ticketLineId) {
+        invalidFields.push(`${prefix}.ticketLineId`);
+        issues.push({ field: `${prefix}.ticketLineId`, reason: 'missing', message: 'ticketLineId is required.' });
+      }
+      if (!Number.isFinite(qty) || qty <= 0) {
+        invalidFields.push(`${prefix}.qty`);
+        issues.push({ field: `${prefix}.qty`, reason: 'invalid', message: `qty must be a positive integer. Received=${String(rawLine.qty)}.` });
+      }
+      if (!Number.isFinite(freeQty) || freeQty < 0 || (Number.isFinite(qty) && freeQty > qty)) {
+        invalidFields.push(`${prefix}.freeQty`);
+        issues.push({ field: `${prefix}.freeQty`, reason: 'invalid', message: `freeQty must be between 0 and qty. Received=${String(rawLine.freeQty ?? rawLine.free_qty ?? 0)}.` });
+      }
+      if (!Number.isFinite(extraEach) || extraEach < 0) {
+        invalidFields.push(`${prefix}.extraEach`);
+        issues.push({ field: `${prefix}.extraEach`, reason: 'invalid', message: `extraEach must be a non-negative number. Received=${String(rawLine.extraEach ?? rawLine.extra_each ?? 0)}.` });
+      }
+    });
+  }
+
+  if (rawQuoteLines && rawQuoteLines.length && !row.quoteLines.length) {
+    invalidFields.push('quoteLines');
+    issues.push({ field: 'quoteLines', reason: 'sanitized-empty', message: 'quoteLines were present but all lines were dropped during sanitization.' });
+  }
+
+  let pricing = null;
+  if (!issues.length) {
+    try {
+      pricing = recomputePricing(publishedPayload, row.quoteLines);
+    } catch (err) {
+      invalidFields.push('quoteLines');
+      issues.push({ field: 'quoteLines', reason: 'pricing-recompute-failed', message: String((err && err.message) || err || 'Pricing recompute failed.') });
+    }
+  }
+
+  const uniqueMissingFields = Array.from(new Set(missingFields));
+  const uniqueInvalidFields = Array.from(new Set(invalidFields));
+  let reason = '';
+  if (issues.some((entry) => entry.reason === 'stale')) reason = 'snapshot-stale';
+  else if (uniqueMissingFields.length) reason = 'missing-required-fields';
+  else if (uniqueInvalidFields.length) reason = 'invalid-fields';
+
+  return {
+    ok: issues.length === 0,
+    reason,
+    missingFields: uniqueMissingFields,
+    invalidFields: uniqueInvalidFields,
+    issues,
+    pricing,
+  };
+}
+
 function bookingLockFromRow(row) {
   const src = row && typeof row === 'object' ? row : {};
   const status = bookingStatus(src.status);
@@ -250,6 +360,11 @@ function applyUserOperation(db, op, actor, logAudit) {
     target.departmentIds = normalizeDepartmentIds(meta.department_ids ?? meta.departmentIds, target.departmentIds || []);
   }
 
+  function applyManagerTitle(target) {
+    const requestedTitle = normalizeManagerTitle(meta.manager_title ?? meta.managerTitle, '');
+    target.managerTitle = target.canAccessManager ? requestedTitle || 'Manager' : '';
+  }
+
   if (op.op === 'create_user') {
     const target = existing || { id: randomId('user'), createdAt: now, updatedAt: now, status: 'active', isLocked: false, wwid: op.wwid };
     target.wwid = op.wwid;
@@ -260,6 +375,7 @@ function applyUserOperation(db, op, actor, logAudit) {
     target.phone = String(meta.phone || target.phone || '').trim();
     target.passwordHash = hashPassword(String(meta.temp_password || 'Temp123A'));
     applyRole(target);
+    applyManagerTitle(target);
     applyDepartments(target);
     target.status = 'active';
     target.forcePasswordReset = forceResetExplicit !== null ? forceResetExplicit : shouldForceResetFromMeta;
@@ -280,6 +396,7 @@ function applyUserOperation(db, op, actor, logAudit) {
     if (Object.prototype.hasOwnProperty.call(meta, 'phone')) existing.phone = String(meta.phone || '').trim();
     if (op.displayName || Object.prototype.hasOwnProperty.call(meta, 'display_name')) existing.displayName = String(op.displayName || meta.display_name || `${existing.firstName || ''} ${existing.lastName || ''}`).trim();
     if (meta.temp_password) existing.passwordHash = hashPassword(String(meta.temp_password));
+    applyManagerTitle(existing);
     applyDepartments(existing);
     existing.forcePasswordReset = forceResetExplicit !== null ? forceResetExplicit : shouldForceResetFromMeta ? true : existing.forcePasswordReset;
     existing.updatedAt = now;
@@ -315,6 +432,12 @@ async function upsertBookingRows(db, incomingRequests) {
     const current = existingById.get(String((request && request.id) || '')) || {};
     const row = sanitizeBookingRow(request, current);
     const status = bookingStatus(row.status);
+    bookingDebugLog('validator_incoming_row', {
+      rawIncomingRow: request,
+      currentRow: current,
+      sanitizedRow: row,
+      serverSnapshotVersion: serverVersion,
+    });
 
     if (status === 'deleted') {
       row.updatedAt = nowIso();
@@ -325,20 +448,31 @@ async function upsertBookingRows(db, incomingRequests) {
 
     const isNew = !existingById.has(row.id);
     if (isNew || status === 'pending') {
-      if (row.snapshotVersion !== serverVersion) {
+      const diagnostics = bookingValidationDiagnostics(request, row, serverVersion, published.payload);
+      if (!diagnostics.ok) {
+        const message = diagnostics.reason === 'snapshot-stale'
+          ? `Snapshot is stale for booking ${row.id}. Device=${row.snapshotVersion}, server=${serverVersion}.`
+          : `Booking ${row.id} failed validation.`;
+        const body = {
+          ok: false,
+          reason: diagnostics.reason || 'booking-validation-failed',
+          code: diagnostics.reason === 'snapshot-stale' ? 'SNAPSHOT_STALE' : 'BOOKING_VALIDATION_FAILED',
+          message,
+          server_snapshot_version: serverVersion,
+          missing_fields: diagnostics.missingFields,
+          invalid_fields: diagnostics.invalidFields,
+          issues: diagnostics.issues,
+          raw_incoming_row: request,
+          sanitized_row: row,
+        };
+        bookingDebugLog('validator_rejection', body);
         return {
           ok: false,
-          status: 409,
-          body: {
-            ok: false,
-            reason: 'snapshot-stale',
-            code: 'SNAPSHOT_STALE',
-            message: `Snapshot is stale for booking ${row.id}. Device=${row.snapshotVersion}, server=${serverVersion}.`,
-            server_snapshot_version: serverVersion,
-          },
+          status: diagnostics.reason === 'snapshot-stale' ? 409 : 400,
+          body,
         };
       }
-      const pricing = recomputePricing(published.payload, row.quoteLines);
+      const pricing = diagnostics.pricing;
       row.authoritativeTotals = pricing;
       row.commissionProfit = pricing.profit;
     } else {

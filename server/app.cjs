@@ -7,6 +7,7 @@ const {
   nowIso,
   toInt,
   normalizeRole,
+  normalizeManagerTitle,
   normalizeStatus,
   normalizeIdentifier,
   normalizeEmail,
@@ -21,6 +22,7 @@ const {
   readDb,
   withDb,
   listUsers,
+  listOnDutyManagerUsers,
   findUserByIdentifier,
   findUserRowByIdentifier,
   mapUserToState,
@@ -29,6 +31,7 @@ const {
   createSessionRecord,
   getSessionRecord,
   updateSessionRecordRole,
+  updateSessionDutyStatus,
   revokeSessionRecord,
   updateUserPassword,
 } = require('./db.cjs');
@@ -108,6 +111,15 @@ function corsOriginMatches(rule, origin) {
   if (!normalizedRule.includes('*')) return normalizedRule === normalizedOrigin;
   const pattern = `^${normalizedRule.split('*').map((part) => escapeRegExp(part)).join('.*')}$`;
   return new RegExp(pattern, 'i').test(normalizedOrigin);
+}
+
+function boolFromRequest(value, fallback = false) {
+  if (typeof value === 'boolean') return value;
+  const text = String(value ?? '').trim().toLowerCase();
+  if (!text) return !!fallback;
+  if (['1', 'true', 'yes', 'y', 'on', 'active'].includes(text)) return true;
+  if (['0', 'false', 'no', 'n', 'off', 'inactive'].includes(text)) return false;
+  return !!fallback;
 }
 
 async function createApp(options = {}) {
@@ -199,7 +211,7 @@ async function createApp(options = {}) {
   }
 
   async function createSession(userId, activeRole) {
-    const session = await createSessionRecord(db, { userId, activeRole, ttlMs: sessionTtlMs });
+    const session = await createSessionRecord(db, { userId, activeRole, managerOnDuty: activeRole === 'manager', ttlMs: sessionTtlMs });
     return session.id;
   }
 
@@ -272,6 +284,7 @@ async function createApp(options = {}) {
       canAccessMarketer: !!user.canAccessMarketer,
       canAccessAdmin: !!user.canAccessAdmin,
       canAccessManager: !!user.canAccessManager,
+      managerTitle: normalizeManagerTitle(user.managerTitle, ''),
       managerOnly: !!user.managerOnly,
       departmentIds: Array.isArray(user.departmentIds) ? user.departmentIds.map((entry) => String(entry || '').trim()).filter(Boolean) : [],
       active: status === 'active',
@@ -289,32 +302,123 @@ async function createApp(options = {}) {
       : {};
   }
 
-  function managerUserOperationRestrictionMessage(userOps) {
+  function requestActiveRole(req) {
+    return normalizeRole((req && req.auth && req.auth.payload && req.auth.payload.role) || (req && req.auth && req.auth.session && req.auth.session.activeRole));
+  }
+
+  function normalizeDepartmentScope(value) {
+    const list = Array.isArray(value) ? value : [];
+    const seen = new Set();
+    const out = [];
+    list.forEach((entry) => {
+      const id = String(entry || '').trim();
+      if (!id || seen.has(id)) return;
+      seen.add(id);
+      out.push(id);
+    });
+    return out;
+  }
+
+  function sharesDepartmentScope(left, right) {
+    const a = normalizeDepartmentScope(left);
+    const b = new Set(normalizeDepartmentScope(right));
+    if (!a.length || !b.size) return false;
+    return a.some((entry) => b.has(entry));
+  }
+
+  function managerTitleAppRole(title) {
+    const normalized = normalizeManagerTitle(title, '');
+    if (normalized === 'Assistant Manager') return 'assistant_manager';
+    if (normalized === 'Supervisor') return 'supervisor';
+    if (normalized === 'Manager') return 'manager';
+    return 'marketer';
+  }
+
+  function managerUserOperationRestrictionMessage(userOps, actorDepartments = []) {
     const list = Array.isArray(userOps) ? userOps : [];
+    const scopedDepartments = normalizeDepartmentScope(actorDepartments);
+    if (!scopedDepartments.length) {
+      return 'Managers must belong to a department before creating users.';
+    }
     for (const op of list) {
       const row = op && typeof op === 'object' ? op : {};
       const metadata = row.metadata && typeof row.metadata === 'object' && !Array.isArray(row.metadata) ? row.metadata : {};
       const role = String(row.role || '').trim().toLowerCase();
-      if (!['create_user', 'update_user', 'set_user_status'].includes(String(row.op || '').trim().toLowerCase())) {
-        return 'Managers can only create or update marketer accounts.';
+      const action = String(row.op || '').trim().toLowerCase();
+      const wantsManagerAccess =
+        !!metadata.can_access_manager ||
+        !!metadata.canAccessManager ||
+        !!metadata.allow_manager_mode ||
+        !!metadata.allowManagerMode ||
+        !!metadata.manager_only ||
+        !!metadata.managerOnly ||
+        !!String(metadata.manager_title || metadata.managerTitle || '').trim();
+      const managerTitle = normalizeManagerTitle(metadata.manager_title ?? metadata.managerTitle, '');
+      if (!['create_user', 'update_user', 'set_user_status'].includes(action)) {
+        return 'Managers can only create or update department user accounts.';
       }
       if (role !== 'marketer') {
-        return 'Managers can only sync marketer accounts.';
+        return 'Managers can only sync marketer-based department accounts.';
       }
       if (
         !!metadata.can_access_admin ||
         !!metadata.canAccessAdmin ||
-        !!metadata.can_access_manager ||
-        !!metadata.canAccessManager ||
-        !!metadata.manager_only ||
-        !!metadata.managerOnly ||
+        !!metadata.allow_admin_mode ||
+        !!metadata.allowAdminMode ||
         !!metadata.is_assistant ||
         !!metadata.isAssistant
       ) {
-        return 'Managers cannot grant admin or manager access while syncing marketers.';
+        return 'Managers cannot grant admin access while syncing department users.';
+      }
+      if (wantsManagerAccess && !managerTitle) {
+        return 'Managers must choose Assistant Manager or Supervisor when creating a manager.';
       }
     }
     return '';
+  }
+
+  function normalizeManagerScopedUserOperations(userOps, actorUser) {
+    const list = Array.isArray(userOps) ? userOps : [];
+    const actorDepartments = normalizeDepartmentScope(actorUser && actorUser.departmentIds);
+    return list.map((entry) => {
+      const row = entry && typeof entry === 'object' ? entry : {};
+      const metadata = row.metadata && typeof row.metadata === 'object' && !Array.isArray(row.metadata) ? { ...row.metadata } : {};
+      const managerTitle = normalizeManagerTitle(metadata.manager_title ?? metadata.managerTitle, '');
+      const wantsManagerAccess =
+        !!metadata.can_access_manager ||
+        !!metadata.canAccessManager ||
+        !!metadata.allow_manager_mode ||
+        !!metadata.allowManagerMode ||
+        !!metadata.manager_only ||
+        !!metadata.managerOnly ||
+        !!managerTitle;
+      metadata.department_ids = actorDepartments.slice();
+      delete metadata.departmentIds;
+      delete metadata.can_access_admin;
+      delete metadata.canAccessAdmin;
+      delete metadata.allow_admin_mode;
+      delete metadata.allowAdminMode;
+      delete metadata.is_assistant;
+      delete metadata.isAssistant;
+      if (wantsManagerAccess) {
+        metadata.can_access_manager = true;
+        metadata.allow_manager_mode = true;
+        metadata.manager_only = true;
+        metadata.can_access_marketer = false;
+        metadata.allow_marketer_mode = false;
+        metadata.manager_title = managerTitle || 'Manager';
+      } else {
+        metadata.can_access_manager = false;
+        metadata.allow_manager_mode = false;
+        metadata.manager_only = false;
+        delete metadata.manager_title;
+      }
+      return {
+        ...row,
+        role: 'marketer',
+        metadata,
+      };
+    });
   }
 
   function userSupportsVerificationRole(user, requestedRole) {
@@ -446,7 +550,11 @@ async function createApp(options = {}) {
       };
     }
     const sessionId = String(updatedSession.id || currentSession.id || '').trim();
-    const payload = buildSessionPayload(targetUser, { activeRole: nextRole, createdAt: updatedSession.createdAt || currentSession.createdAt || nowIso() });
+    const payload = buildSessionPayload(targetUser, {
+      activeRole: nextRole,
+      managerOnDuty: !!(updatedSession && updatedSession.managerOnDuty),
+      createdAt: updatedSession.createdAt || currentSession.createdAt || nowIso(),
+    });
     return {
       status: 200,
       body: {
@@ -560,18 +668,97 @@ async function createApp(options = {}) {
   app.get('/api/users', requireSession, async (req, res, next) => {
     try {
       const permissions = requestPermissions(req);
-      const canAdmin = !!permissions.manage_admin_updates;
-      const canManager = !!permissions.manage_marketer_users;
+      const activeRole = requestActiveRole(req);
+      const canAdmin = activeRole === 'admin' ? !!permissions.manage_admin_updates : false;
+      const canManager = activeRole === 'manager' ? !!permissions.manage_marketer_users : !!permissions.manage_marketer_users && !permissions.manage_admin_updates;
       if (!canAdmin && !canManager) {
         res.status(403).json({ ok: false, code: 'FORBIDDEN', message: 'Missing permission: manage_marketer_users' });
         return;
       }
       const rows = await listUsers(db);
       let users = Array.isArray(rows) ? rows.map(mapUserForClient).filter(Boolean) : [];
-      if (!canAdmin) {
-        users = users.filter((user) => normalizeRole(user && user.role) === 'marketer');
+      if (canManager && !canAdmin) {
+        const actorDepartments = req && req.auth && req.auth.user ? req.auth.user.departmentIds : [];
+        users = users.filter(
+          (user) => normalizeRole(user && user.role) === 'marketer' && sharesDepartmentScope(actorDepartments, user && user.departmentIds),
+        );
       }
       res.json({ ok: true, users });
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.get('/api/managers/on-duty', requireSession, requirePermission('view_catalog'), async (req, res, next) => {
+    try {
+      const actorDepartments = req && req.auth && req.auth.user ? req.auth.user.departmentIds : [];
+      const [users, onDutyRows] = await Promise.all([listUsers(db), listOnDutyManagerUsers(db)]);
+      const onDutyIds = new Set(
+        (Array.isArray(onDutyRows) ? onDutyRows : [])
+          .map((user) => String((user && user.id) || '').trim())
+          .filter(Boolean),
+      );
+      const managers = Array.isArray(users)
+        ? users
+            .filter(
+              (user) =>
+                !!(user && user.canAccessManager) &&
+                normalizeStatus(user && user.status) === 'active' &&
+                sharesDepartmentScope(actorDepartments, user && user.departmentIds),
+            )
+            .map((user) => ({
+              ...mapUserForClient(user),
+              managerTitle: normalizeManagerTitle(user && user.managerTitle, 'Manager'),
+              onDuty: onDutyIds.has(String((user && user.id) || '').trim()),
+            }))
+        : [];
+      res.json({ ok: true, managers });
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.post('/api/managers/duty', requireSession, requirePermission('punch_in'), async (req, res, next) => {
+    try {
+      const currentSession = req && req.auth ? req.auth.session : null;
+      const actorUser = req && req.auth ? req.auth.user : null;
+      if (!currentSession || !actorUser || !actorUser.canAccessManager) {
+        res.status(403).json({ ok: false, code: 'FORBIDDEN', message: 'Only manager-capable accounts can change duty status.' });
+        return;
+      }
+      const wantsOnDuty = boolFromRequest(
+        req && req.body && Object.prototype.hasOwnProperty.call(req.body, 'on_duty') ? req.body.on_duty : req && req.body ? req.body.onDuty : undefined,
+        !!(currentSession && currentSession.managerOnDuty),
+      );
+      const updatedSession = await updateSessionDutyStatus(db, currentSession.id, wantsOnDuty);
+      if (!updatedSession) {
+        res.status(401).json({ ok: false, code: 'UNAUTHORIZED', message: 'Sign in is required.' });
+        return;
+      }
+      const payload = buildSessionPayload(actorUser, {
+        activeRole: updatedSession.activeRole || currentSession.activeRole || requestActiveRole(req),
+        managerOnDuty: !!updatedSession.managerOnDuty,
+        createdAt: updatedSession.createdAt || currentSession.createdAt || nowIso(),
+      });
+      await withDb(db, async (state) => {
+        logAudit(state, {
+          action: wantsOnDuty ? 'manager.duty_on' : 'manager.duty_off',
+          actorUserId: actorUser.id,
+          actorName: actorUser.displayName,
+          targetType: 'session',
+          targetId: updatedSession.id,
+          details: {
+            activeRole: updatedSession.activeRole || currentSession.activeRole || requestActiveRole(req),
+            managerOnDuty: !!updatedSession.managerOnDuty,
+          },
+        });
+      });
+      res.json({
+        ok: true,
+        message: wantsOnDuty ? 'You are now On Duty.' : 'You are now Off Duty.',
+        manager_on_duty: !!updatedSession.managerOnDuty,
+        session: payload,
+      });
     } catch (error) {
       next(error);
     }
@@ -608,7 +795,7 @@ async function createApp(options = {}) {
           details: { activeRole: signIn.activeRole },
         });
       });
-      const payload = buildSessionPayload(signIn.user, { activeRole: signIn.activeRole, createdAt: nowIso() });
+      const payload = buildSessionPayload(signIn.user, { activeRole: signIn.activeRole, managerOnDuty: signIn.activeRole === 'manager', createdAt: nowIso() });
       res.json({ ok: true, message: signIn.body.message, session: payload, permissions: payload.permissions, session_id: sessionId, session_transport: 'cookie_or_bearer', session_ttl_ms: sessionTtlMs });
     } catch (error) {
       next(error);
@@ -792,25 +979,30 @@ async function createApp(options = {}) {
 
   app.post('/api/bookings/:id/claim', requireSession, requirePermission('booking_manage'), async (req, res, next) => {
     try {
-      await withDb(db, async (db) => {
+      const claimResponse = await withDb(db, async (db) => {
         const bookingId = String(req.params.id || '').trim();
         const rows = Array.isArray(db.bookings) ? db.bookings : [];
         const found = rows.find((row) => String(row.id || '') === bookingId && bookingStatus(row.status) !== 'deleted');
         if (!found) {
-          res.status(404).json({ ok: false, reason: 'missing', message: 'Booking request was not found.' });
-          return;
+          return { status: 404, body: { ok: false, reason: 'missing', message: 'Booking request was not found.' } };
         }
         const status = bookingStatus(found.status);
         const actorName = String(req.auth.user.displayName || '').trim() || 'Admin';
         const actorUserId = String(req.auth.user.id || '').trim();
         const actorDevice = String((req.body && req.body.actor_device) || 'web').trim();
         if (status === 'done') {
-          res.status(409).json({ ok: false, reason: 'already-done', message: 'Request is already done.', lock: bookingLockFromRow(found) });
-          return;
+          return { status: 409, body: { ok: false, reason: 'already-done', message: 'Request is already done.', lock: bookingLockFromRow(found) } };
         }
         if (status === 'working' && String(found.workingByUserId || '') && String(found.workingByUserId || '') !== actorUserId) {
-          res.status(409).json({ ok: false, reason: 'owner-locked', message: `Already claimed by ${String(found.workingByName || 'another admin')}.`, lock: bookingLockFromRow(found) });
-          return;
+          return {
+            status: 409,
+            body: {
+              ok: false,
+              reason: 'owner-locked',
+              message: `Already claimed by ${String(found.workingByName || 'another admin')}.`,
+              lock: bookingLockFromRow(found),
+            },
+          };
         }
         const stamp = nowIso();
         found.status = 'working';
@@ -832,8 +1024,9 @@ async function createApp(options = {}) {
           actorName,
           details: { actorDevice },
         });
-        res.json({ ok: true, message: 'Request claimed.', lock: bookingLockFromRow(found) });
+        return { status: 200, body: { ok: true, message: 'Request claimed.', lock: bookingLockFromRow(found) } };
       });
+      res.status((claimResponse && claimResponse.status) || 500).json((claimResponse && claimResponse.body) || { ok: false, message: 'Booking claim failed.' });
     } catch (error) {
       next(error);
     }
@@ -841,29 +1034,33 @@ async function createApp(options = {}) {
 
   app.post('/api/bookings/:id/complete', requireSession, requirePermission('booking_manage'), async (req, res, next) => {
     try {
-      await withDb(db, async (db) => {
+      const completeResponse = await withDb(db, async (db) => {
         const bookingId = String(req.params.id || '').trim();
         const rows = Array.isArray(db.bookings) ? db.bookings : [];
         const found = rows.find((row) => String(row.id || '') === bookingId && bookingStatus(row.status) !== 'deleted');
         if (!found) {
-          res.status(404).json({ ok: false, reason: 'missing', message: 'Booking request was not found.' });
-          return;
+          return { status: 404, body: { ok: false, reason: 'missing', message: 'Booking request was not found.' } };
         }
         const status = bookingStatus(found.status);
         const actorName = String(req.auth.user.displayName || '').trim() || 'Admin';
         const actorUserId = String(req.auth.user.id || '').trim();
         const actorDevice = String((req.body && req.body.actor_device) || 'web').trim();
         if (status === 'done') {
-          res.status(409).json({ ok: false, reason: 'already-done', message: 'Request is already done.', lock: bookingLockFromRow(found) });
-          return;
+          return { status: 409, body: { ok: false, reason: 'already-done', message: 'Request is already done.', lock: bookingLockFromRow(found) } };
         }
         if (status !== 'working') {
-          res.status(409).json({ ok: false, reason: 'missing-owner', message: 'Mark request as Working first.' });
-          return;
+          return { status: 409, body: { ok: false, reason: 'missing-owner', message: 'Mark request as Working first.' } };
         }
         if (String(found.workingByUserId || '') && String(found.workingByUserId || '') !== actorUserId) {
-          res.status(409).json({ ok: false, reason: 'owner-only-done', message: `Only ${String(found.workingByName || 'the assigned admin')} can mark Done.`, lock: bookingLockFromRow(found) });
-          return;
+          return {
+            status: 409,
+            body: {
+              ok: false,
+              reason: 'owner-only-done',
+              message: `Only ${String(found.workingByName || 'the assigned admin')} can mark Done.`,
+              lock: bookingLockFromRow(found),
+            },
+          };
         }
         const stamp = nowIso();
         found.status = 'done';
@@ -882,8 +1079,9 @@ async function createApp(options = {}) {
           actorName,
           details: { actorDevice },
         });
-        res.json({ ok: true, message: 'Request marked done.', lock: bookingLockFromRow(found) });
+        return { status: 200, body: { ok: true, message: 'Request marked done.', lock: bookingLockFromRow(found) } };
       });
+      res.status((completeResponse && completeResponse.status) || 500).json((completeResponse && completeResponse.body) || { ok: false, message: 'Booking completion failed.' });
     } catch (error) {
       next(error);
     }
@@ -891,23 +1089,20 @@ async function createApp(options = {}) {
 
   app.post('/api/bookings/:id/release', requireSession, requirePermission('booking_manage'), async (req, res, next) => {
     try {
-      await withDb(db, async (db) => {
+      const releaseResponse = await withDb(db, async (db) => {
         const bookingId = String(req.params.id || '').trim();
         const rows = Array.isArray(db.bookings) ? db.bookings : [];
         const found = rows.find((row) => String(row.id || '') === bookingId && bookingStatus(row.status) !== 'deleted');
         if (!found) {
-          res.status(404).json({ ok: false, reason: 'missing', message: 'Booking request was not found.' });
-          return;
+          return { status: 404, body: { ok: false, reason: 'missing', message: 'Booking request was not found.' } };
         }
         const status = bookingStatus(found.status);
         const actorUserId = String(req.auth.user.id || '').trim();
         if (status === 'done') {
-          res.status(409).json({ ok: false, reason: 'already-done', message: 'Done requests cannot be released.' });
-          return;
+          return { status: 409, body: { ok: false, reason: 'already-done', message: 'Done requests cannot be released.' } };
         }
         if (status === 'working' && String(found.workingByUserId || '') && String(found.workingByUserId || '') !== actorUserId) {
-          res.status(409).json({ ok: false, reason: 'owner-only-release', message: 'Only the current owner can release this booking.' });
-          return;
+          return { status: 409, body: { ok: false, reason: 'owner-only-release', message: 'Only the current owner can release this booking.' } };
         }
         found.status = 'pending';
         found.adminName = '';
@@ -932,8 +1127,9 @@ async function createApp(options = {}) {
           actorName: req.auth.user.displayName,
           details: {},
         });
-        res.json({ ok: true, message: 'Booking ownership released.' });
+        return { status: 200, body: { ok: true, message: 'Booking ownership released.' } };
       });
+      res.status((releaseResponse && releaseResponse.status) || 500).json((releaseResponse && releaseResponse.body) || { ok: false, message: 'Booking release failed.' });
     } catch (error) {
       next(error);
     }
@@ -973,15 +1169,16 @@ async function createApp(options = {}) {
       }
       if (action === 'verify_user_login_state') {
         const permissions = requestPermissions(req);
-        const canAdmin = !!permissions.manage_admin_updates;
-        const canManager = !!permissions.manage_marketer_users;
+        const activeRole = requestActiveRole(req);
+        const canAdmin = activeRole === 'admin' ? !!permissions.manage_admin_updates : false;
+        const canManager = activeRole === 'manager' ? !!permissions.manage_marketer_users : !!permissions.manage_marketer_users && !permissions.manage_admin_updates;
         const requestedRole = normalizeRole(body.role) || 'marketer';
         if (!canAdmin && !canManager) {
           res.status(403).json({ ok: false, message: 'Only admins and managers can verify cloud user login state.' });
           return;
         }
-        if (!canAdmin && requestedRole !== 'marketer') {
-          res.status(403).json({ ok: false, message: 'Managers can only verify marketer cloud login state.' });
+        if (!canAdmin && !['marketer', 'manager'].includes(requestedRole)) {
+          res.status(403).json({ ok: false, message: 'Managers can only verify marketer or manager cloud login state.' });
           return;
         }
         const verification = await verifyUserLoginStateCore(body);
@@ -995,10 +1192,19 @@ async function createApp(options = {}) {
           return;
         }
         const sessionId = await createSession(signIn.user.id, signIn.activeRole);
-        const payload = buildSessionPayload(signIn.user, { activeRole: signIn.activeRole, createdAt: nowIso() });
+        const payload = buildSessionPayload(signIn.user, { activeRole: signIn.activeRole, managerOnDuty: signIn.activeRole === 'manager', createdAt: nowIso() });
         const publicUser = payload && payload.user ? payload.user : null;
+        const managerTitle = normalizeManagerTitle((publicUser && publicUser.managerTitle) || signIn.user.managerTitle, '');
+        const appRole =
+          signIn.activeRole === 'manager'
+            ? managerTitleAppRole(managerTitle)
+            : signIn.user.isAssistant
+              ? 'assistant_admin'
+              : signIn.user.role === 'admin'
+                ? 'primary_admin'
+                : 'marketer';
         setSessionCookie(res, sessionId);
-        res.status(200).json({ ok: true, hard_fail: false, message: signIn.body.message, permissions: payload.permissions, session_id: sessionId, session_transport: 'cookie_or_bearer', session_ttl_ms: sessionTtlMs, available_roles: Array.isArray(payload.availableRoles) ? payload.availableRoles : [], user: { user_id: signIn.user.id, role: signIn.activeRole === 'admin' ? 'admin' : 'marketer', app_role: signIn.user.isAssistant ? 'assistant_admin' : signIn.user.role === 'admin' ? 'primary_admin' : 'marketer', status: signIn.user.status, force_password_reset: !!signIn.user.forcePasswordReset, first_name: signIn.user.firstName, last_name: signIn.user.lastName, display_name: signIn.user.displayName, work_email: signIn.user.email, wwid: signIn.user.wwid, cloud_account_state: 'ready', created_at: signIn.user.createdAt, updated_at: signIn.user.updatedAt, can_access_marketer: !!(publicUser && publicUser.canAccessMarketer), can_access_admin: !!(publicUser && publicUser.canAccessAdmin), can_access_manager: !!(publicUser && publicUser.canAccessManager), manager_only: !!(publicUser && publicUser.managerOnly) } });
+        res.status(200).json({ ok: true, hard_fail: false, message: signIn.body.message, role: signIn.activeRole, resolved_role: signIn.activeRole, permissions: payload.permissions, session_id: sessionId, session_transport: 'cookie_or_bearer', session_ttl_ms: sessionTtlMs, available_roles: Array.isArray(payload.availableRoles) ? payload.availableRoles : [], manager_on_duty: !!payload.managerOnDuty, user: { user_id: signIn.user.id, role: normalizeRole(signIn.user.role) || 'marketer', app_role: appRole, status: signIn.user.status, force_password_reset: !!signIn.user.forcePasswordReset, first_name: signIn.user.firstName, last_name: signIn.user.lastName, display_name: signIn.user.displayName, work_email: signIn.user.email, wwid: signIn.user.wwid, cloud_account_state: 'ready', created_at: signIn.user.createdAt, updated_at: signIn.user.updatedAt, can_access_marketer: !!(publicUser && publicUser.canAccessMarketer), can_access_admin: !!(publicUser && publicUser.canAccessAdmin), can_access_manager: !!(publicUser && publicUser.canAccessManager), manager_title: managerTitle, manager_only: !!(publicUser && publicUser.managerOnly) } });
         return;
       }
       if (action === 'auth_complete_password_reset') {
@@ -1037,17 +1243,29 @@ async function createApp(options = {}) {
           updated_at: updatedAt,
         };
         const user = mapUserToState(updatedRow);
-        const payload = buildSessionPayload(user, { activeRole: role, createdAt: nowIso() });
+        const payload = buildSessionPayload(user, { activeRole: role, managerOnDuty: role === 'manager', createdAt: nowIso() });
         const publicUser = payload && payload.user ? payload.user : null;
+        const managerTitle = normalizeManagerTitle((publicUser && publicUser.managerTitle) || user.managerTitle, '');
+        const appRole =
+          role === 'manager'
+            ? managerTitleAppRole(managerTitle)
+            : user.isAssistant
+              ? 'assistant_admin'
+              : user.role === 'admin'
+                ? 'primary_admin'
+                : 'marketer';
         res.status(200).json({
           ok: true,
           message: 'Password updated.',
+          role,
+          resolved_role: role,
           permissions: payload.permissions,
           available_roles: Array.isArray(payload.availableRoles) ? payload.availableRoles : [],
+          manager_on_duty: !!payload.managerOnDuty,
           user: {
             user_id: user.id,
-            role,
-            app_role: user.isAssistant ? 'assistant_admin' : user.role === 'admin' ? 'primary_admin' : 'marketer',
+            role: normalizeRole(user.role) || 'marketer',
+            app_role: appRole,
             status: user.status,
             force_password_reset: !!user.forcePasswordReset,
             first_name: user.firstName,
@@ -1061,6 +1279,7 @@ async function createApp(options = {}) {
             can_access_marketer: !!(publicUser && publicUser.canAccessMarketer),
             can_access_admin: !!(publicUser && publicUser.canAccessAdmin),
             can_access_manager: !!(publicUser && publicUser.canAccessManager),
+            manager_title: managerTitle,
             manager_only: !!(publicUser && publicUser.managerOnly),
           },
         });
@@ -1155,13 +1374,29 @@ async function createApp(options = {}) {
           res.status(403).json({ ok: false, reason: 'forbidden', message: 'Missing booking write permission.' });
           return;
         }
-        await withDb(db, async (db) => {
+        const saveResponse = await withDb(db, async (db) => {
           const incoming = Array.isArray(body.payload && body.payload.requests) ? body.payload.requests : [];
           const result = await upsertBookingRows(db, incoming);
-          if (!result.ok) { res.status(result.status).json(result.body); return; }
+          if (!result.ok) {
+            return { status: result.status, body: result.body };
+          }
           const locks = result.rows.map(bookingLockFromRow).filter(Boolean);
-          res.json({ ok: true, row: { stage: 'booking_requests', payload: { meta: { source: 'booking-requests', updatedAt: nowIso(), version: 1 }, requests: result.rows }, updated_at: nowIso(), updated_by: req.auth.user.id }, locks, message: 'Booking updates synced to cloud.' });
+          return {
+            status: 200,
+            body: {
+              ok: true,
+              row: {
+                stage: 'booking_requests',
+                payload: { meta: { source: 'booking-requests', updatedAt: nowIso(), version: 1 }, requests: result.rows },
+                updated_at: nowIso(),
+                updated_by: req.auth.user.id,
+              },
+              locks,
+              message: 'Booking updates synced to cloud.',
+            },
+          };
         });
+        res.status((saveResponse && saveResponse.status) || 200).json((saveResponse && saveResponse.body) || { ok: false, message: 'Booking save failed.' });
         return;
       }
       if (action === 'booking_claim' || action === 'booking_complete' || action === 'booking_release') {
@@ -1176,12 +1411,11 @@ async function createApp(options = {}) {
           return;
         }
 
-        await withDb(db, async (db) => {
+        const manageResponse = await withDb(db, async (db) => {
           const rows = Array.isArray(db.bookings) ? db.bookings : [];
           const found = rows.find((entry) => String(entry.id || '') === requestId && bookingStatus(entry.status) !== 'deleted');
           if (!found) {
-            res.status(200).json({ ok: false, reason: 'missing', message: 'Booking request was not found.' });
-            return;
+            return { status: 200, body: { ok: false, reason: 'missing', message: 'Booking request was not found.' } };
           }
 
           const actorName = String(req.auth.user.displayName || '').trim() || 'Admin';
@@ -1191,17 +1425,18 @@ async function createApp(options = {}) {
 
           if (action === 'booking_claim') {
             if (status === 'done') {
-              res.status(200).json({ ok: false, reason: 'already-done', message: 'Already marked Done.', lock: bookingLockFromRow(found) });
-              return;
+              return { status: 200, body: { ok: false, reason: 'already-done', message: 'Already marked Done.', lock: bookingLockFromRow(found) } };
             }
             if (status === 'working' && String(found.workingByUserId || '') && String(found.workingByUserId || '') !== actorUserId) {
-              res.status(200).json({
-                ok: false,
-                reason: 'owner-locked',
-                message: `Already claimed by ${String(found.workingByName || 'another admin')}.`,
-                lock: bookingLockFromRow(found),
-              });
-              return;
+              return {
+                status: 200,
+                body: {
+                  ok: false,
+                  reason: 'owner-locked',
+                  message: `Already claimed by ${String(found.workingByName || 'another admin')}.`,
+                  lock: bookingLockFromRow(found),
+                },
+              };
             }
             const stamp = nowIso();
             found.status = 'working';
@@ -1223,27 +1458,26 @@ async function createApp(options = {}) {
               actorName,
               details: { actorDevice, source: 'cloud' },
             });
-            res.status(200).json({ ok: true, message: 'Request claimed.', lock: bookingLockFromRow(found) });
-            return;
+            return { status: 200, body: { ok: true, message: 'Request claimed.', lock: bookingLockFromRow(found) } };
           }
 
           if (action === 'booking_complete') {
             if (status === 'done') {
-              res.status(200).json({ ok: false, reason: 'already-done', message: 'Already marked Done.', lock: bookingLockFromRow(found) });
-              return;
+              return { status: 200, body: { ok: false, reason: 'already-done', message: 'Already marked Done.', lock: bookingLockFromRow(found) } };
             }
             if (status !== 'working') {
-              res.status(200).json({ ok: false, reason: 'missing-owner', message: 'Mark this request as Working first.' });
-              return;
+              return { status: 200, body: { ok: false, reason: 'missing-owner', message: 'Mark this request as Working first.' } };
             }
             if (String(found.workingByUserId || '') && String(found.workingByUserId || '') !== actorUserId) {
-              res.status(200).json({
-                ok: false,
-                reason: 'owner-only-done',
-                message: `Only ${String(found.workingByName || 'the assigned admin')} can mark Done.`,
-                lock: bookingLockFromRow(found),
-              });
-              return;
+              return {
+                status: 200,
+                body: {
+                  ok: false,
+                  reason: 'owner-only-done',
+                  message: `Only ${String(found.workingByName || 'the assigned admin')} can mark Done.`,
+                  lock: bookingLockFromRow(found),
+                },
+              };
             }
             const stamp = nowIso();
             found.status = 'done';
@@ -1262,17 +1496,14 @@ async function createApp(options = {}) {
               actorName,
               details: { actorDevice, source: 'cloud' },
             });
-            res.status(200).json({ ok: true, message: 'Request marked Done.', lock: bookingLockFromRow(found) });
-            return;
+            return { status: 200, body: { ok: true, message: 'Request marked Done.', lock: bookingLockFromRow(found) } };
           }
 
           if (status === 'done') {
-            res.status(200).json({ ok: false, reason: 'already-done', message: 'Done requests cannot be released.' });
-            return;
+            return { status: 200, body: { ok: false, reason: 'already-done', message: 'Done requests cannot be released.' } };
           }
           if (status === 'working' && String(found.workingByUserId || '') && String(found.workingByUserId || '') !== actorUserId) {
-            res.status(200).json({ ok: false, reason: 'owner-only-release', message: 'Only the current owner can release this booking.' });
-            return;
+            return { status: 200, body: { ok: false, reason: 'owner-only-release', message: 'Only the current owner can release this booking.' } };
           }
           found.status = 'pending';
           found.adminName = '';
@@ -1297,8 +1528,9 @@ async function createApp(options = {}) {
             actorName,
             details: { source: 'cloud' },
           });
-          res.status(200).json({ ok: true, message: 'Booking ownership cleared.' });
+          return { status: 200, body: { ok: true, message: 'Booking ownership cleared.' } };
         });
+        res.status((manageResponse && manageResponse.status) || 500).json((manageResponse && manageResponse.body) || { ok: false, message: 'Booking action failed.' });
         return;
       }
       if (action === 'save_and_send') {
@@ -1340,20 +1572,22 @@ async function createApp(options = {}) {
       if (action === 'apply_user_operations') {
         const result = await withDb(db, async (db) => {
           const permissions = requestPermissions(req);
-          const canAdmin = !!permissions.manage_admin_updates;
-          const canManager = !!permissions.manage_marketer_users;
+          const activeRole = requestActiveRole(req);
+          const canAdmin = activeRole === 'admin' ? !!permissions.manage_admin_updates : false;
+          const canManager = activeRole === 'manager' ? !!permissions.manage_marketer_users : !!permissions.manage_marketer_users && !permissions.manage_admin_updates;
           if (!canAdmin && !canManager) {
             return { status: 403, body: { ok: false, message: 'Only admins and managers can sync user login state.' } };
           }
-          const userOps = normalizeUserOperations(body.user_operations || body.operations);
+          let userOps = normalizeUserOperations(body.user_operations || body.operations);
           if (!userOps.length) {
             return { status: 200, body: { ok: true, message: 'No user operations were supplied.', user_operations: { received: 0, applied: 0 } } };
           }
-          if (!canAdmin) {
-            const restrictionMessage = managerUserOperationRestrictionMessage(userOps);
+          if (canManager && !canAdmin) {
+            const restrictionMessage = managerUserOperationRestrictionMessage(userOps, req.auth.user && req.auth.user.departmentIds);
             if (restrictionMessage) {
               return { status: 403, body: { ok: false, message: restrictionMessage } };
             }
+            userOps = normalizeManagerScopedUserOperations(userOps, req.auth.user);
           }
           const actor = { userId: req.auth.user.id, name: req.auth.user.displayName };
           userOps.forEach((op) => applyUserOperation(db, op, actor, logAudit));
@@ -1389,6 +1623,8 @@ async function createApp(options = {}) {
 
   app.use((error, _req, res, _next) => {
     const message = String((error && error.message) || error || 'Server error');
+    console.error(error && error.stack ? error.stack : message);
+    if (res.headersSent) return;
     res.status(500).json({ ok: false, message });
   });
 
