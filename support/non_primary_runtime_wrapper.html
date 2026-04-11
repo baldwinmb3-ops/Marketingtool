@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Flicker Pricing Redirect Wrapper</title>
+<style>
+body{margin:0;font-family:Segoe UI,Tahoma,Arial,sans-serif;background:linear-gradient(180deg,#f6fbf8,#e8f1ee);color:#173527}
+.wrap{max-width:760px;margin:0 auto;padding:32px 18px;display:flex;flex-direction:column;gap:14px;min-height:100vh;justify-content:center}
+.card{background:#fff;border:1px solid #d0ddd5;border-radius:18px;padding:22px;box-shadow:0 8px 24px rgba(0,0,0,.08)}
+.badge{display:inline-flex;align-items:center;justify-content:center;border:1px solid #bfd0c5;background:#f7fcf9;color:#204533;border-radius:999px;padding:6px 10px;font-size:11px;font-weight:900;letter-spacing:.05em;text-transform:uppercase}
+h1{margin:0;font-size:28px}
+p{margin:0;line-height:1.5}
+code{display:block;margin-top:8px;padding:10px 12px;border:1px solid #d9e6de;background:#f8fcf9;border-radius:12px;word-break:break-all}
+.actions{display:flex;flex-wrap:wrap;gap:10px;margin-top:6px}
+.btn{display:inline-flex;align-items:center;justify-content:center;border:1px solid #b7cabd;background:#ecf6ef;color:#204533;border-radius:10px;padding:10px 14px;font-weight:700;font-size:14px;text-decoration:none}
+.btn.admin{background:#e6effc;border-color:#b9cce8;color:#254466}
+.status{font-size:13px;color:#587061}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="card">
+    <span class="badge">BUILD: 2026-04-03 init-fix-03</span>
+    <h1>Non-Primary App Wrapper</h1>
+    <p>This file is not allowed to act as an independent runtime anymore. The app source of truth is the repo-root HTML file below.</p>
+    <code id="primary-source">C:/Users/Dell/Documents/projects/marketingtool/premium_pricing_clickable.html</code>
+    <div class="actions">
+      <a id="open-root-http" class="btn admin" href="/premium_pricing_clickable.html">Open Primary Source On This Origin</a>
+      <a id="open-root-file" class="btn" href="file:///C:/Users/Dell/Documents/projects/marketingtool/premium_pricing_clickable.html">Open Primary Root File</a>
+    </div>
+    <p id="status" class="status">Checking whether the primary runtime is reachable from here...</p>
+  </div>
+</div>
+<script>
+(async()=>{
+  const ROOT_FILE_URL='file:///C:/Users/Dell/Documents/projects/marketingtool/premium_pricing_clickable.html';
+  const ROOT_HTTP_URL=`${window.location.origin}/premium_pricing_clickable.html`;
+  const statusEl=document.getElementById('status');
+  const currentHref=String(window.location.href||'');
+  console.warn('[Flicker Wrapper]',{
+    loadedFileIdentity:currentHref,
+    buildId:'2026-04-03 init-fix-03',
+    primarySourceOfTruth:'C:/Users/Dell/Documents/projects/marketingtool/premium_pricing_clickable.html'
+  });
+  if(window.location.protocol==='file:'){
+    if(currentHref!==ROOT_FILE_URL){
+      statusEl.textContent='Opening the primary root file now...';
+      window.location.replace(ROOT_FILE_URL);
+      return;
+    }
+    statusEl.textContent='You are already on the primary root file.';
+    return;
+  }
+  if(!/^https?:$/i.test(window.location.protocol)){
+    statusEl.textContent='Unsupported protocol. Use the root file link above.';
+    return;
+  }
+  if(currentHref===ROOT_HTTP_URL){
+    statusEl.textContent='This launcher is serving a wrapper from a package folder. Use the root file link above or the repo-root launcher.';
+    return;
+  }
+  try{
+    const response=await fetch(ROOT_HTTP_URL,{method:'GET',cache:'no-store'});
+    if(response.ok){
+      statusEl.textContent='Primary source found on this origin. Redirecting now...';
+      window.location.replace(ROOT_HTTP_URL);
+      return;
+    }
+    statusEl.textContent='This origin does not expose the primary source at /premium_pricing_clickable.html. Use the root file link above.';
+  }catch(err){
+    statusEl.textContent='Could not verify the primary source automatically. Use the root file link above.';
+  }
+})();
+</script>
+</body>
+</html>

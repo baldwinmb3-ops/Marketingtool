@@ -1,0 +1,19 @@
+{
+  "name": "Flicker Pricing",
+  "short_name": "Flicker",
+  "description": "Flicker pricing and booking operations app.",
+  "start_url": "/premium_pricing_clickable.html",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#edf4f1",
+  "theme_color": "#0f2b4d",
+  "icons": [
+    {
+      "src": "/logo.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    }
+  ]
+}

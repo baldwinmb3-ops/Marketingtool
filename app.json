@@ -1,0 +1,12 @@
+{
+  "expo": {
+    "name": "Premium Pricing App",
+    "slug": "premium-pricing-app",
+    "version": "0.1.0",
+    "orientation": "default",
+    "userInterfaceStyle": "light",
+    "assetBundlePatterns": [
+      "**/*"
+    ]
+  }
+}

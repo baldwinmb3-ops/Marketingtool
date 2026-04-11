@@ -1,0 +1,12 @@
+[
+  {
+    "identifier": "WWID_OR_EMAIL_FOR_ADMIN_SMOKE",
+    "password": "CURRENT_ADMIN_SMOKE_PASSWORD",
+    "role": "admin"
+  },
+  {
+    "identifier": "WWID_OR_EMAIL_FOR_MARKETER_SMOKE",
+    "password": "CURRENT_MARKETER_SMOKE_PASSWORD",
+    "role": "marketer"
+  }
+]

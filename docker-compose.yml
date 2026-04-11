@@ -1,0 +1,51 @@
+services:
+  marketingtool-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: marketingtool
+    ports:
+      - "5432:5432"
+    volumes:
+      - marketingtool_pgdata:/var/lib/postgresql/data
+    restart: unless-stopped
+
+  marketingtool-api:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    depends_on:
+      - marketingtool-db
+    ports:
+      - "8787:8787"
+    environment:
+      API_HOST: "0.0.0.0"
+      API_PORT: "8787"
+      DATABASE_URL: "postgres://postgres:postgres@marketingtool-db:5432/marketingtool"
+      APP_CORS_ORIGIN: "http://localhost:4173"
+      APP_SESSION_SECRET: "change-me-in-prod"
+      APP_COOKIE_SECURE: "false"
+    restart: unless-stopped
+
+  marketingtool-web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      - marketingtool-api
+    ports:
+      - "4173:4173"
+    environment:
+      HOST: "0.0.0.0"
+      PORT: "4173"
+      APP_API_BASE_URL: "http://marketingtool-api:8787"
+      APP_REMOTE_URL: ""
+      APP_REMOTE_READ_KEY: ""
+      APP_REMOTE_STATE_TABLE: "pricing_catalog_state"
+      APP_REMOTE_SYNC_FUNCTION: "dynamic-processor"
+      APP_REMOTE_SYNC_ENDPOINT: ""
+    restart: unless-stopped
+
+volumes:
+  marketingtool_pgdata:

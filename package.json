@@ -1,0 +1,123 @@
+{
+  "name": "premium-pricing-app",
+  "description": "Flicker Pricing desktop and mobile app shell.",
+  "author": "Flicker Team",
+  "version": "0.1.0",
+  "private": true,
+  "main": "node_modules/expo/AppEntry.js",
+  "scripts": {
+    "start": "expo start",
+    "android": "expo start --android",
+    "ios": "expo start --ios",
+    "web": "expo start --web",
+    "typecheck": "tsc --noEmit",
+    "html:serve": "node scripts/serve-html.mjs",
+    "dev:local": "node scripts/start-local.mjs",
+    "dev:local:clean": "node scripts/start-local.mjs --clean",
+    "backend:start": "node server/index.cjs",
+    "backend:memory:start": "node server/index-memory.cjs",
+    "backend:dev": "node --watch server/index.cjs",
+    "users:audit": "node scripts/audit-user-durability.mjs",
+    "db:migrate": "node server/scripts/migrate.cjs",
+    "db:seed": "node server/scripts/seed.cjs",
+    "db:reset": "node server/scripts/reset-db.cjs",
+    "db:import-json": "node server/scripts/import-json.cjs",
+    "users:backup": "npm run users:export",
+    "users:backup:auto": "node server/scripts/users-backup-auto.cjs",
+    "users:backup:auto:register": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/register-users-backup-task.ps1",
+    "users:export": "node server/scripts/users-export.cjs",
+    "users:validate": "node server/scripts/users-validate.cjs",
+    "users:import": "node server/scripts/users-import.cjs",
+    "users:restore": "node server/scripts/users-import.cjs",
+    "users:restore:proof": "node server/scripts/users-restore-proof.cjs",
+    "users:panic-check": "node server/scripts/users-panic-check.cjs",
+    "snapshots:export": "node server/scripts/snapshots-export.cjs",
+    "snapshots:validate": "node server/scripts/snapshots-validate.cjs",
+    "bookings:export": "node server/scripts/bookings-export.cjs",
+    "bookings:validate": "node server/scripts/bookings-validate.cjs",
+    "release:preflight": "node server/scripts/release-preflight.cjs",
+    "release:postdeploy": "node server/scripts/release-postdeploy.cjs",
+    "sim:scenarios": "node server/scripts/scenario-runner.cjs all",
+    "sim:conflict": "node server/scripts/scenario-runner.cjs conflict",
+    "sim:stale": "node server/scripts/scenario-runner.cjs stale",
+    "sim:permissions": "node server/scripts/scenario-runner.cjs non-admin",
+    "sim:session": "node server/scripts/scenario-runner.cjs session",
+    "sim:load": "node server/scripts/load-sim.cjs",
+    "test:backend": "node --test server/tests/*.test.cjs",
+    "test:auth-sync": "node --test tests/auth-sync-race.test.cjs",
+    "test:delete-flow": "node --test tests/delete-flow.test.cjs",
+    "desktop:dev": "electron desktop/main.cjs",
+    "desktop:build:win": "set CSC_IDENTITY_AUTO_DISCOVERY=false&& electron-builder --win nsis --x64 --config.win.signAndEditExecutable=false --publish never",
+    "desktop:build:mac-test": "CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --mac dmg --x64 --arm64 --publish never",
+    "generate:runtime-config": "node scripts/generate-runtime-config.js",
+    "build": "npm run generate:runtime-config && node scripts/build-vercel-static.js",
+    "vercel-build": "npm run build",
+    "deploy:production": "node scripts/deploy-production.mjs"
+  },
+  "dependencies": {
+    "cookie-parser": "^1.4.7",
+    "cors": "^2.8.5",
+    "express": "^4.21.2",
+    "expo": "latest",
+    "expo-status-bar": "latest",
+    "pg": "^8.16.3",
+    "react": "latest",
+    "react-dom": "19.2.0",
+    "react-native": "latest",
+    "react-native-web": "^0.21.0"
+  },
+  "devDependencies": {
+    "@types/react": "latest",
+    "electron": "^36.5.0",
+    "electron-builder": "^26.0.12",
+    "pg-mem": "^3.0.5",
+    "playwright": "^1.58.2",
+    "supertest": "^7.1.1",
+    "typescript": "latest"
+  },
+  "build": {
+    "appId": "com.flicker.premiumpricing",
+    "productName": "Flicker Pricing",
+    "directories": {
+      "output": "dist-desktop"
+    },
+    "files": [
+      "desktop/**/*",
+      "premium_pricing_clickable.html",
+      "logo.png",
+      "*.jpg",
+      "*.jpeg",
+      "*.png",
+      "*.svg",
+      "manifest.webmanifest",
+      "runtime-config.js",
+      "version.json",
+      "package.json"
+    ],
+    "extraMetadata": {
+      "main": "desktop/main.cjs"
+    },
+    "win": {
+      "signAndEditExecutable": false,
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ]
+    },
+    "mac": {
+      "target": [
+        {
+          "target": "dmg",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "category": "public.app-category.business"
+    }
+  }
+}
