@@ -424,18 +424,23 @@ function applyUserOperation(db, op, actor, logAudit) {
 
 async function upsertBookingRows(db, incomingRequests) {
   if (!Array.isArray(db.bookings)) db.bookings = [];
-  const existingById = new Map(db.bookings.map((entry) => [String(entry.id || ''), entry]));
+  const existingRows = db.bookings
+    .map((entry) => sanitizeBookingRow(entry, {}))
+    .filter((entry) => entry && String(entry.id || '').trim());
+  const existingById = new Map(existingRows.map((entry) => [String(entry.id || ''), entry]));
   const published = db.snapshots && db.snapshots.published ? db.snapshots.published : null;
   if (!published || !published.payload) {
     return { ok: false, status: 409, body: { ok: false, message: 'No published snapshot available for booking validation.' } };
   }
   const serverVersion = Math.max(1, toInt(published.version, 1));
-  const nextRows = [];
+  const nextById = new Map(existingRows.map((entry) => [String(entry.id || ''), entry]));
+  const incomingOrder = [];
 
   for (const request of incomingRequests) {
     const current = existingById.get(String((request && request.id) || '')) || {};
     const row = sanitizeBookingRow(request, current);
     const status = bookingStatus(row.status);
+    const rowId = String(row.id || '').trim();
     bookingDebugLog('validator_incoming_row', {
       rawIncomingRow: request,
       currentRow: current,
@@ -446,7 +451,8 @@ async function upsertBookingRows(db, incomingRequests) {
     if (status === 'deleted') {
       row.updatedAt = nowIso();
       row.revision = Math.max(1, toInt(current.revision, 0) + 1);
-      nextRows.push(row);
+      nextById.set(rowId, row);
+      incomingOrder.push(rowId);
       continue;
     }
 
@@ -487,10 +493,32 @@ async function upsertBookingRows(db, incomingRequests) {
     row.updatedAt = nowIso();
     row.revision = Math.max(1, toInt(current.revision, 0) + 1);
     if (!row.createdAt) row.createdAt = nowIso();
-    nextRows.push(row);
+    nextById.set(rowId, row);
+    incomingOrder.push(rowId);
   }
 
-  db.bookings = nextRows;
+  const finalRows = [];
+  const seen = new Set();
+  existingRows.forEach((entry) => {
+    const id = String((entry && entry.id) || '').trim();
+    if (!id || seen.has(id) || !nextById.has(id)) return;
+    seen.add(id);
+    finalRows.push(nextById.get(id));
+  });
+  incomingOrder.forEach((id) => {
+    const key = String(id || '').trim();
+    if (!key || seen.has(key) || !nextById.has(key)) return;
+    seen.add(key);
+    finalRows.push(nextById.get(key));
+  });
+  nextById.forEach((entry, id) => {
+    const key = String(id || '').trim();
+    if (!key || seen.has(key)) return;
+    seen.add(key);
+    finalRows.push(entry);
+  });
+
+  db.bookings = finalRows;
   return { ok: true, rows: db.bookings.filter((entry) => bookingStatus(entry.status) !== 'deleted') };
 }
 
