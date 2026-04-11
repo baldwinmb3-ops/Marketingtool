@@ -138,7 +138,6 @@ input,textarea,select{width:100%;border:1px solid #bed0c6;background:#fbfdfb;bor
 .syncHeaderCard{padding:2px 0;display:flex;justify-content:flex-end;align-items:center;background:transparent;border:none;box-shadow:none}
 .syncStatusBtn{border:0;border-radius:999px;padding:7px 12px;font-size:11px;font-weight:900;letter-spacing:.05em;cursor:pointer;box-shadow:0 1px 2px rgba(0,0,0,.12);text-transform:uppercase}
 .syncStatusBtn.ok{background:#1f6b35;color:#f7fff9}
-.syncStatusBtn.ready{background:#244d77;color:#f5fbff}
 .syncStatusBtn.flash{animation:cloudSyncFlash 1s ease-out 1}
 .syncStatusBtn.warn{background:#9c2f2f;color:#fff6f6}
 @keyframes cloudSyncFlash{0%{transform:scale(.9);opacity:.35}40%{transform:scale(1.05);opacity:1}100%{transform:scale(1);opacity:1}}
@@ -2601,15 +2600,6 @@ function cloudSyncButtonState(){
 const role=normalizeAuthRole(s.role);
 if(role!=='admin'&&role!=='marketer')return null;
 const blocked=(role==='admin')&&!!s.remoteHoldLocalAfterPublishFail,connected=cloudSyncReadyForBooking()&&!remoteSyncManualRequired&&!blocked,flashActive=connected&&Date.now()<cloudSyncSuccessFlashUntilMs,hasSyncIssue=blocked||!!remoteSyncManualRequired||!!String(remoteSyncLastError||'').trim();
-if(role==='marketer'){
-if(flashActive){cloudSyncWarningVisible(false);return{connected:true,warning:false,mode:'success',label:'\u2713',hint:'Cloud synced.'};}
-if(hasSyncIssue){
-if(!cloudSyncWarningVisible(true))return null;
-return{connected:false,warning:true,mode:'warning',label:'Sync Now',hint:'Tap to refresh cloud data and booking updates.'};
-}
-cloudSyncWarningVisible(false);
-return{connected:connected,warning:false,mode:'ready',label:'Sync Now',hint:connected?'Tap to refresh cloud data and booking updates.':'Tap to sync cloud data and booking updates.'};
-}
 if(connected&&!flashActive){cloudSyncWarningVisible(false);return null;}
 if(!connected&&!hasSyncIssue){cloudSyncWarningVisible(false);return null;}
 if(flashActive){cloudSyncWarningVisible(false);return{connected:true,warning:false,mode:'success',label:'\u2713',hint:'Cloud synced.'};}
@@ -2620,9 +2610,9 @@ function cloudSyncHeaderHtml(stateOverride=null){
 const state=stateOverride||cloudSyncButtonState();
 if(!state)return'';
 if(state.mode==='success'){return`<div class="syncPillSlot"><span class="syncStatusBtn ok flash" title="${h(state.hint)}" aria-label="${h(state.hint)}">${h(state.label)}</span></div>`;}
-return`<div class="syncPillSlot"><button class="syncStatusBtn ${state.mode==='warning'?'warn':'ready'}" data-action="cloud-sync-now" title="${h(state.hint)}" aria-label="${h(state.hint)}">${h(state.label)}</button></div>`;
+return`<div class="syncPillSlot"><button class="syncStatusBtn warn" data-action="cloud-sync-now" title="${h(state.hint)}" aria-label="${h(state.hint)}">${h(state.label)}</button></div>`;
 }
-function showCloudSyncHelpGuide(){const role=normalizeAuthRole(s.role)||'marketer',step4=role==='admin'?'4. If it still fails, open Settings > Cloud Sync and reconnect cloud settings.':'4. If it still fails, contact an admin or IT support.';openDialog({title:'Cloud Sync Help',message:`1. Check Wi-Fi connection.\n2. Tap Sync Now.\n3. If it still fails, close and reopen the app.\n${step4}`,buttons:[{label:'Sync Now',action:'cloud-sync-now',tone:'admin'},{label:'Check Wi-Fi',action:'cloud-check-wifi',tone:'default'},{label:'Close',action:'close-app-dialog',tone:'default'}]});}
+function showCloudSyncHelpGuide(){const role=normalizeAuthRole(s.role)||'marketer',step4=role==='admin'?'4. If it still fails, open Settings > Cloud Sync and reconnect cloud settings.':'4. If it still fails, contact an admin or IT support.';openDialog({title:'Cloud Sync Help',message:`1. Check Wi-Fi connection.\n2. Tap the red sync button.\n3. If it still fails, close and reopen the app.\n${step4}`,buttons:[{label:'Sync Now',action:'cloud-sync-now',tone:'admin'},{label:'Check Wi-Fi',action:'cloud-check-wifi',tone:'default'},{label:'Close',action:'close-app-dialog',tone:'default'}]});}
 function showCloudSyncWifiTip(){showAlert('Check wifi connection, then tap the sync button again.','Check Wi-Fi');}
 function showCloudSyncFailureDialog(){
 const role=normalizeAuthRole(s.role)||'marketer',issue=cloudSyncIssueDetails(String(remoteSyncLastError||s.remoteStatusMessage||''),role),message=`App cannot sync right now.\n\nReason: ${issue.reason}\nCode: ${issue.code}${issue.friendly?`\nHelp: ${issue.friendly}`:''}${issue.detail?`\nDetails: ${issue.detail}`:''}\n\nShare this message with admin support.`;
@@ -4883,6 +4873,7 @@ const published=await remotePublishDraft({silent:true,sourceLabel:String(o.recov
 if(!published)return false;
 return runCloudSyncNow({silent:o.silent,includeBookings:o.includeBookings,renderOnFinish:o.renderOnFinish,flashOnSuccess:o.flashOnSuccess,updateRemoteStatus:o.updateRemoteStatus});
 }
+async function ensureFreshCloudSyncForMarketerSend(contextLabel='sending a booking request'){if(normalizeAuthRole(s.role)!=='marketer')return ensureCloudSyncForAction(contextLabel);const ok=await runCloudSyncNowWithRecovery({silent:true,includeBookings:true,renderOnFinish:true,flashOnSuccess:false,updateRemoteStatus:false,recoverySourceLabel:`marketer-send-preflight:${String(contextLabel||'continuing')}`});if(ok)return true;promptCloudSyncRequired(contextLabel,{force:true});return false;}
 async function ensureCloudSyncForAction(contextLabel='continuing'){const role=normalizeAuthRole(s.role);if(role!=='admin'&&role!=='marketer')return true;if(cloudSyncReadyForBooking())return true;const ok=await runCloudSyncNow({silent:true,includeBookings:true});if(ok)return true;promptCloudSyncRequired(contextLabel);return false;}
 function resetStartupCloudHealthCheck(){cloudStartupHealthCheckRunning=false;cloudStartupHealthCheckDone=false;cloudStartupHealthCheckOk=false;cloudStartupHealthCheckPromise=null;}
 async function runStartupCloudHealthCheck(opts={}){
@@ -6116,7 +6107,7 @@ if(a==='send-booking-request'){
 e.preventDefault();
 e.stopImmediatePropagation();
 void(async()=>{
-const ready=await ensureCloudSyncForAction('sending a booking request');
+const ready=await ensureFreshCloudSyncForMarketerSend('sending a booking request');
 if(!ready)return;
 const saved=saveMarketerBookingDraft();
 if(!(saved&&saved.ok))return;
@@ -6147,7 +6138,7 @@ if(a==='skip-booking-tour'){
 e.preventDefault();
 e.stopImmediatePropagation();
 void(async()=>{
-const ready=await ensureCloudSyncForAction('saving a tracker item');
+const ready=await ensureFreshCloudSyncForMarketerSend('saving a tracker item');
 if(!ready)return;
 const saved=saveMarketerBookingDraft();
 if(!(saved&&saved.ok))return;
