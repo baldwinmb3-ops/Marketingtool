@@ -29,6 +29,14 @@ function normalizeAppRole(value) {
   return 'marketer';
 }
 
+function normalizeManagerTitle(value, fallback = '') {
+  const key = String(value ?? '').trim().toLowerCase();
+  if (key === 'manager') return 'Manager';
+  if (key === 'assistant manager' || key === 'assistant_manager' || key === 'assistant-manager') return 'Assistant Manager';
+  if (key === 'supervisor') return 'Supervisor';
+  return String(fallback || '').trim();
+}
+
 function normalizeStatus(value) {
   const key = String(value ?? '').trim().toLowerCase();
   if (key === 'inactive') return 'inactive';
@@ -78,6 +86,7 @@ module.exports = {
   toNum,
   normalizeRole,
   normalizeAppRole,
+  normalizeManagerTitle,
   normalizeStatus,
   normalizeWwid,
   normalizeEmail,
