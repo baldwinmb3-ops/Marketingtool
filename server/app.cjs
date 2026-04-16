@@ -21,6 +21,7 @@ const {
   initDatabase,
   readDb,
   withDb,
+  withLockedWriteTransaction,
   listUsers,
   listOnDutyManagerUsers,
   findUserByIdentifier,
@@ -120,6 +121,17 @@ function boolFromRequest(value, fallback = false) {
   if (['1', 'true', 'yes', 'y', 'on', 'active'].includes(text)) return true;
   if (['0', 'false', 'no', 'n', 'off', 'inactive'].includes(text)) return false;
   return !!fallback;
+}
+
+function parseJsonBody(value, fallback = {}) {
+  if (value && typeof value === 'object' && !Array.isArray(value)) return value;
+  if (typeof value === 'string') {
+    try {
+      const parsed = JSON.parse(value);
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return parsed;
+    } catch {}
+  }
+  return fallback;
 }
 
 async function createApp(options = {}) {
@@ -917,39 +929,52 @@ async function createApp(options = {}) {
 
   app.post('/api/bookings', requireSession, requirePermission('booking_create'), async (req, res, next) => {
     try {
-      let responseStatus = 201;
-      let responseBody = null;
-      await withDb(db, async (db) => {
-        if (!Array.isArray(db.bookings)) db.bookings = [];
-        const published = db.snapshots && db.snapshots.published ? db.snapshots.published : null;
-        if (!published || !published.payload) {
-          responseStatus = 409;
-          responseBody = {
-            ok: false,
-            code: 'NO_PUBLISHED_SNAPSHOT',
-            message: 'No published snapshot is available.',
+      const incoming = sanitizeBookingRow(req.body || {}, {});
+      const actorUserId = String((req.auth && req.auth.user && req.auth.user.id) || '').trim();
+      const actorName = String((req.auth && req.auth.user && req.auth.user.displayName) || '').trim();
+      const response = await withLockedWriteTransaction(db, async (client) => {
+        const publishedRes = await client.query(
+          'SELECT version, payload FROM snapshot_published_current WHERE id = TRUE LIMIT 1',
+        );
+        const publishedRow = publishedRes.rows[0] || null;
+        const publishedPayload = parseJsonBody(publishedRow && publishedRow.payload, {});
+        if (!publishedRow || !publishedPayload || !Object.keys(publishedPayload).length) {
+          return {
+            status: 409,
+            body: {
+              ok: false,
+              code: 'NO_PUBLISHED_SNAPSHOT',
+              message: 'No published snapshot is available.',
+            },
           };
-          return;
         }
-        const incoming = sanitizeBookingRow(req.body || {}, {});
-        const serverVersion = Math.max(1, toInt(published.version, 1));
+
+        const serverVersion = Math.max(1, toInt(publishedRow && publishedRow.version, 1));
         if (incoming.snapshotVersion !== serverVersion) {
-          responseStatus = 409;
-          responseBody = {
-            ok: false,
-            code: 'SNAPSHOT_STALE',
-            message: `Snapshot is stale. Device=${incoming.snapshotVersion}, server=${serverVersion}.`,
-            server_snapshot_version: serverVersion,
+          return {
+            status: 409,
+            body: {
+              ok: false,
+              code: 'SNAPSHOT_STALE',
+              message: `Snapshot is stale. Device=${incoming.snapshotVersion}, server=${serverVersion}.`,
+              server_snapshot_version: serverVersion,
+            },
           };
-          return;
         }
-        const existing = db.bookings.find((row) => String(row.id || '') === incoming.id && bookingStatus(row.status) !== 'deleted');
-        if (existing) {
-          responseStatus = 409;
-          responseBody = { ok: false, code: 'BOOKING_EXISTS', message: 'Booking already exists.' };
-          return;
+
+        const existingRes = await client.query(
+          `SELECT 1
+             FROM bookings
+            WHERE id = $1
+              AND LOWER(COALESCE(status, 'pending')) <> 'deleted'
+            LIMIT 1`,
+          [incoming.id],
+        );
+        if (existingRes.rows[0]) {
+          return { status: 409, body: { ok: false, code: 'BOOKING_EXISTS', message: 'Booking already exists.' } };
         }
-        const pricing = recomputePricing(published.payload, incoming.quoteLines);
+
+        const pricing = recomputePricing(publishedPayload, incoming.quoteLines);
         const stamp = nowIso();
         incoming.authoritativeTotals = pricing;
         incoming.commissionProfit = pricing.profit;
@@ -958,23 +983,60 @@ async function createApp(options = {}) {
         incoming.createdAt = stamp;
         incoming.updatedAt = stamp;
         incoming.revision = 1;
-        db.bookings.push(incoming);
-        logAudit(db, { action: 'booking.create', actorUserId: req.auth.user.id, actorName: req.auth.user.displayName, targetType: 'booking', targetId: incoming.id, details: { snapshotVersion: incoming.snapshotVersion, authoritativeTotals: pricing } });
-        logBookingEvent(db, {
-          bookingId: incoming.id,
-          eventType: 'booking.create',
-          actorUserId: req.auth.user.id,
-          actorName: req.auth.user.displayName,
-          details: { snapshotVersion: incoming.snapshotVersion, authoritativeTotals: pricing },
-        });
-        responseStatus = 201;
-        responseBody = { ok: true, booking: incoming };
+
+        await client.query(
+          `INSERT INTO bookings (
+             id, status, snapshot_version, revision, working_by_user_id, completed_by_user_id, created_at, updated_at, row_data
+           ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb)`,
+          [
+            String(incoming.id || '').trim(),
+            String(incoming.status || 'pending').trim().toLowerCase() || 'pending',
+            Math.max(1, toInt(incoming.snapshotVersion, 1)),
+            Math.max(1, toInt(incoming.revision, 1)),
+            String(incoming.workingByUserId || '').trim() || null,
+            String(incoming.completedByUserId || '').trim() || null,
+            incoming.createdAt,
+            incoming.updatedAt,
+            JSON.stringify(incoming),
+          ],
+        );
+
+        const auditAt = nowIso();
+        await client.query(
+          `INSERT INTO audit_log (
+             id, at, action, actor_user_id, actor_name, target_type, target_id, details
+           ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb)`,
+          [
+            randomId('audit'),
+            auditAt,
+            'booking.create',
+            actorUserId,
+            actorName,
+            'booking',
+            String(incoming.id || '').trim(),
+            JSON.stringify({ snapshotVersion: incoming.snapshotVersion, authoritativeTotals: pricing }),
+          ],
+        );
+
+        const eventAt = nowIso();
+        await client.query(
+          `INSERT INTO booking_events (
+             id, booking_id, event_type, actor_user_id, actor_name, details, created_at
+           ) VALUES ($1,$2,$3,$4,$5,$6::jsonb,$7)`,
+          [
+            randomId('booking-event'),
+            String(incoming.id || '').trim(),
+            'booking.create',
+            actorUserId || null,
+            actorName,
+            JSON.stringify({ snapshotVersion: incoming.snapshotVersion, authoritativeTotals: pricing }),
+            eventAt,
+          ],
+        );
+
+        return { status: 201, body: { ok: true, booking: incoming } };
       });
-      if (responseBody) {
-        res.status(responseStatus).json(responseBody);
-        return;
-      }
-      res.status(500).json({ ok: false, message: 'Booking write completed without response payload.' });
+      res.status((response && response.status) || 500).json((response && response.body) || { ok: false, message: 'Booking write completed without response payload.' });
     } catch (error) {
       next(error);
     }

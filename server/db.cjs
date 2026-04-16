@@ -1002,6 +1002,31 @@ async function withDb(pool, task) {
   return run;
 }
 
+async function withLockedWriteTransaction(pool, task) {
+  const prior = DB_QUEUE_BY_POOL.get(pool) || Promise.resolve();
+  const run = prior.then(async () => {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      try {
+        await client.query("SELECT pg_advisory_xact_lock(hashtext('marketingtool_state_lock'))");
+      } catch (_lockError) {
+        // Keep the transaction path usable in environments without advisory lock helpers.
+      }
+      const result = await task(client);
+      await client.query('COMMIT');
+      return result;
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+  });
+  DB_QUEUE_BY_POOL.set(pool, run.catch(() => {}));
+  return run;
+}
+
 function findUserByIdentifier(db, identifier, requestedRole = null) {
   const key = normalizeIdentifier(identifier);
   if (!key) return null;
@@ -1193,6 +1218,7 @@ module.exports = {
   initDatabase,
   readDb,
   withDb,
+  withLockedWriteTransaction,
   findUserByIdentifier,
   findUserRowByIdentifier,
   listUsers,
