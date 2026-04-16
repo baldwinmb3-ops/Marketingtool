@@ -27,7 +27,7 @@ function toPublicUser(user) {
 function deriveAccess(user) {
   const row = user && typeof user === 'object' ? user : {};
   let canAdmin = normalizeRole(row.role) === 'admin' || !!row.canAccessAdmin;
-  let canMarketer = normalizeRole(row.role) === 'marketer' || normalizeRole(row.role) === 'admin' || !!row.canAccessMarketer;
+  let canMarketer = normalizeRole(row.role) === 'marketer' || !!row.canAccessMarketer;
   const canManager = !!row.canAccessManager;
   const managerOnly = !!row.managerOnly && !canAdmin;
 

@@ -503,7 +503,7 @@ function buildRoleCondition(role) {
     return "AND (role = 'admin' OR can_access_admin = TRUE)";
   }
   if (role === 'marketer') {
-    return "AND (role = 'marketer' OR role = 'admin' OR can_access_marketer = TRUE)";
+    return "AND (role = 'marketer' OR can_access_marketer = TRUE)";
   }
   if (role === 'manager') {
     return 'AND can_access_manager = TRUE';
@@ -1018,7 +1018,7 @@ function findUserByIdentifier(db, identifier, requestedRole = null) {
     if (!role) return true;
     if (role === 'admin') return normalizeRole(row.role) === 'admin' || !!row.canAccessAdmin;
     if (role === 'marketer')
-      return normalizeRole(row.role) === 'marketer' || normalizeRole(row.role) === 'admin' || !!row.canAccessMarketer;
+      return normalizeRole(row.role) === 'marketer' || !!row.canAccessMarketer;
     if (role === 'manager') return !!row.canAccessManager;
     return false;
   });
