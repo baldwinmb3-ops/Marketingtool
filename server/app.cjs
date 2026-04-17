@@ -225,8 +225,6 @@ async function createApp(options = {}) {
   const cookieSecure = cookieSameSite === 'none' ? true : cookieSecureFromEnv;
   const trustProxy = parseTrustProxy(process.env.APP_TRUST_PROXY);
   const corsOrigins = parseCorsOriginRules(process.env.APP_CORS_ORIGIN);
-  console.log(`[cors] APP_CORS_ORIGIN raw=${JSON.stringify(String(process.env.APP_CORS_ORIGIN || ''))}`);
-  console.log(`[cors] parsed origins=${JSON.stringify(corsOrigins)}`);
   if (trustProxy !== null) {
     app.set('trust proxy', trustProxy);
   }
@@ -275,7 +273,6 @@ async function createApp(options = {}) {
           callback(null, true);
           return;
         }
-        console.warn(`[cors] rejected origin=${JSON.stringify(String(origin || ''))} allowed=${JSON.stringify(corsOrigins)}`);
         callback(new Error('Origin not allowed by CORS'));
       },
     }),
