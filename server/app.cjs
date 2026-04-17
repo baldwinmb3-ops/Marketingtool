@@ -134,6 +134,83 @@ function parseJsonBody(value, fallback = {}) {
   return fallback;
 }
 
+function bookingRowFromDbRecord(dbRow) {
+  const source = parseJsonBody(dbRow && dbRow.row_data, {});
+  const booking = source && typeof source === 'object' && !Array.isArray(source) ? { ...source } : {};
+  booking.id = String(booking.id || (dbRow && dbRow.id) || '').trim();
+  booking.status = bookingStatus(booking.status || (dbRow && dbRow.status));
+  booking.snapshotVersion = Math.max(1, toInt(booking.snapshotVersion ?? (dbRow && dbRow.snapshot_version), 1));
+  booking.revision = Math.max(1, toInt(booking.revision ?? (dbRow && dbRow.revision), 1));
+  booking.workingByUserId = String(booking.workingByUserId || (dbRow && dbRow.working_by_user_id) || '').trim();
+  booking.completedByUserId = String(booking.completedByUserId || (dbRow && dbRow.completed_by_user_id) || '').trim();
+  booking.createdAt = String(booking.createdAt || (dbRow && dbRow.created_at) || '').trim();
+  booking.updatedAt = String(booking.updatedAt || (dbRow && dbRow.updated_at) || '').trim();
+  return booking;
+}
+
+async function insertAuditLogRow(client, entry) {
+  const row = entry && typeof entry === 'object' ? entry : {};
+  await client.query(
+    `INSERT INTO audit_log (
+       id, at, action, actor_user_id, actor_name, target_type, target_id, details
+     ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb)`,
+    [
+      randomId('audit'),
+      String(row.at || nowIso()).trim() || nowIso(),
+      String(row.action || 'unknown').trim().slice(0, 80),
+      String(row.actorUserId || '').trim() || null,
+      String(row.actorName || '').trim(),
+      String(row.targetType || '').trim().slice(0, 60),
+      String(row.targetId || '').trim().slice(0, 120),
+      JSON.stringify(row.details && typeof row.details === 'object' ? row.details : {}),
+    ],
+  );
+}
+
+async function insertBookingEventRow(client, entry) {
+  const row = entry && typeof entry === 'object' ? entry : {};
+  await client.query(
+    `INSERT INTO booking_events (
+       id, booking_id, event_type, actor_user_id, actor_name, details, created_at
+     ) VALUES ($1,$2,$3,$4,$5,$6::jsonb,$7)`,
+    [
+      randomId('booking-event'),
+      String(row.bookingId || '').trim(),
+      String(row.eventType || 'booking.event').trim().slice(0, 80),
+      String(row.actorUserId || '').trim() || null,
+      String(row.actorName || '').trim(),
+      JSON.stringify(row.details && typeof row.details === 'object' ? row.details : {}),
+      String(row.at || nowIso()).trim() || nowIso(),
+    ],
+  );
+}
+
+async function updateBookingRowRecord(client, booking) {
+  await client.query(
+    `UPDATE bookings
+        SET status = $2,
+            snapshot_version = $3,
+            revision = $4,
+            working_by_user_id = $5,
+            completed_by_user_id = $6,
+            created_at = $7,
+            updated_at = $8,
+            row_data = $9::jsonb
+      WHERE id = $1`,
+    [
+      String(booking.id || '').trim(),
+      String(booking.status || 'pending').trim().toLowerCase() || 'pending',
+      Math.max(1, toInt(booking.snapshotVersion, 1)),
+      Math.max(1, toInt(booking.revision, 1)),
+      String(booking.workingByUserId || '').trim() || null,
+      String(booking.completedByUserId || '').trim() || null,
+      String(booking.createdAt || '').trim() || nowIso(),
+      String(booking.updatedAt || '').trim() || nowIso(),
+      JSON.stringify(booking),
+    ],
+  );
+}
+
 async function createApp(options = {}) {
   const app = express();
   const db = options.db || createPoolFromEnv(options.dbOptions || {});
@@ -1476,13 +1553,22 @@ async function createApp(options = {}) {
           return;
         }
 
-        const manageResponse = await withDb(db, async (db) => {
-          const rows = Array.isArray(db.bookings) ? db.bookings : [];
-          const found = rows.find((entry) => String(entry.id || '') === requestId && bookingStatus(entry.status) !== 'deleted');
-          if (!found) {
+        const manageResponse = await withLockedWriteTransaction(db, async (client) => {
+          const bookingRes = await client.query(
+            `SELECT id, status, snapshot_version, revision, working_by_user_id, completed_by_user_id, created_at, updated_at, row_data
+               FROM bookings
+              WHERE id = $1
+                AND LOWER(COALESCE(status, 'pending')) <> 'deleted'
+              LIMIT 1
+              FOR UPDATE`,
+            [requestId],
+          );
+          const bookingRecord = bookingRes.rows[0] || null;
+          if (!bookingRecord) {
             return { status: 200, body: { ok: false, reason: 'missing', message: 'Booking request was not found.' } };
           }
 
+          const found = bookingRowFromDbRecord(bookingRecord);
           const actorName = String(req.auth.user.displayName || '').trim() || 'Admin';
           const actorUserId = String(req.auth.user.id || '').trim();
           const actorDevice = String(body.actor_device || body.device_id || 'web').trim();
@@ -1515,13 +1601,23 @@ async function createApp(options = {}) {
             found.statusAt = stamp;
             found.updatedAt = stamp;
             found.revision = Math.max(1, toInt(found.revision, 1) + 1);
-            logAudit(db, { action: 'booking.claim', actorUserId, actorName, targetType: 'booking', targetId: found.id, details: { source: 'cloud' } });
-            logBookingEvent(db, {
+            await updateBookingRowRecord(client, found);
+            await insertAuditLogRow(client, {
+              at: nowIso(),
+              action: 'booking.claim',
+              actorUserId,
+              actorName,
+              targetType: 'booking',
+              targetId: found.id,
+              details: { source: 'cloud' },
+            });
+            await insertBookingEventRow(client, {
               bookingId: found.id,
               eventType: 'booking.claim',
               actorUserId,
               actorName,
               details: { actorDevice, source: 'cloud' },
+              at: nowIso(),
             });
             return { status: 200, body: { ok: true, message: 'Request claimed.', lock: bookingLockFromRow(found) } };
           }
@@ -1553,13 +1649,23 @@ async function createApp(options = {}) {
             found.statusAt = stamp;
             found.updatedAt = stamp;
             found.revision = Math.max(1, toInt(found.revision, 1) + 1);
-            logAudit(db, { action: 'booking.complete', actorUserId, actorName, targetType: 'booking', targetId: found.id, details: { source: 'cloud' } });
-            logBookingEvent(db, {
+            await updateBookingRowRecord(client, found);
+            await insertAuditLogRow(client, {
+              at: nowIso(),
+              action: 'booking.complete',
+              actorUserId,
+              actorName,
+              targetType: 'booking',
+              targetId: found.id,
+              details: { source: 'cloud' },
+            });
+            await insertBookingEventRow(client, {
               bookingId: found.id,
               eventType: 'booking.complete',
               actorUserId,
               actorName,
               details: { actorDevice, source: 'cloud' },
+              at: nowIso(),
             });
             return { status: 200, body: { ok: true, message: 'Request marked Done.', lock: bookingLockFromRow(found) } };
           }
@@ -1570,6 +1676,7 @@ async function createApp(options = {}) {
           if (status === 'working' && String(found.workingByUserId || '') && String(found.workingByUserId || '') !== actorUserId) {
             return { status: 200, body: { ok: false, reason: 'owner-only-release', message: 'Only the current owner can release this booking.' } };
           }
+          const stamp = nowIso();
           found.status = 'pending';
           found.adminName = '';
           found.adminUserId = '';
@@ -1582,16 +1689,26 @@ async function createApp(options = {}) {
           found.completedByUserId = '';
           found.completedByDevice = '';
           found.completedAt = '';
-          found.statusAt = nowIso();
-          found.updatedAt = nowIso();
+          found.statusAt = stamp;
+          found.updatedAt = stamp;
           found.revision = Math.max(1, toInt(found.revision, 1) + 1);
-          logAudit(db, { action: 'booking.release', actorUserId, actorName, targetType: 'booking', targetId: found.id, details: { source: 'cloud' } });
-          logBookingEvent(db, {
+          await updateBookingRowRecord(client, found);
+          await insertAuditLogRow(client, {
+            at: nowIso(),
+            action: 'booking.release',
+            actorUserId,
+            actorName,
+            targetType: 'booking',
+            targetId: found.id,
+            details: { source: 'cloud' },
+          });
+          await insertBookingEventRow(client, {
             bookingId: found.id,
             eventType: 'booking.release',
             actorUserId,
             actorName,
             details: { source: 'cloud' },
+            at: nowIso(),
           });
           return { status: 200, body: { ok: true, message: 'Booking ownership cleared.' } };
         });
