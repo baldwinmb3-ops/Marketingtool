@@ -573,12 +573,17 @@ async function listOnDutyManagerUsers(pool) {
   return result.rows.map(mapUserToState);
 }
 
-async function updateUserPassword(pool, userId, passwordHash, forcePasswordReset = false, updatedAt = nowIso()) {
+async function updateUserPassword(pool, userId, passwordHash, forcePasswordReset = false, updatedAt = nowIso(), clearLock = false) {
   const client = await pool.connect();
   try {
     await client.query(
-      `UPDATE users SET password_hash = $1, force_password_reset = $2, updated_at = $3 WHERE id = $4`,
-      [String(passwordHash || ''), toBool(forcePasswordReset, false), toIso(updatedAt), String(userId || '')],
+      `UPDATE users
+       SET password_hash = $1,
+           force_password_reset = $2,
+           updated_at = $3,
+           is_locked = CASE WHEN $5 THEN FALSE ELSE is_locked END
+       WHERE id = $4`,
+      [String(passwordHash || ''), toBool(forcePasswordReset, false), toIso(updatedAt), String(userId || ''), toBool(clearLock, false)],
     );
   } finally {
     client.release();
@@ -1002,6 +1007,32 @@ async function withDb(pool, task) {
   return run;
 }
 
+async function withLockedWriteTransaction(pool, task) {
+  const prior = DB_QUEUE_BY_POOL.get(pool) || Promise.resolve();
+  const run = prior.then(async () => {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      try {
+        await client.query("SELECT pg_advisory_xact_lock(hashtext('marketingtool_state_lock'))");
+      } catch (_lockError) {
+        // pg-mem and some managed environments may not expose advisory lock helpers.
+        // We still serialize writes in-process via DB_QUEUE_BY_POOL.
+      }
+      const result = await task(client);
+      await client.query('COMMIT');
+      return result;
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+  });
+  DB_QUEUE_BY_POOL.set(pool, run.catch(() => {}));
+  return run;
+}
+
 function findUserByIdentifier(db, identifier, requestedRole = null) {
   const key = normalizeIdentifier(identifier);
   if (!key) return null;
@@ -1193,6 +1224,7 @@ module.exports = {
   initDatabase,
   readDb,
   withDb,
+  withLockedWriteTransaction,
   findUserByIdentifier,
   findUserRowByIdentifier,
   listUsers,

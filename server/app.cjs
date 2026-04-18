@@ -9,6 +9,7 @@ const {
   normalizeRole,
   normalizeManagerTitle,
   normalizeStatus,
+  normalizeWwid,
   normalizeIdentifier,
   normalizeEmail,
   verifyPassword,
@@ -21,6 +22,7 @@ const {
   initDatabase,
   readDb,
   withDb,
+  withLockedWriteTransaction,
   listUsers,
   listOnDutyManagerUsers,
   findUserByIdentifier,
@@ -179,6 +181,90 @@ function extractSessionIdFromRequest(req) {
   return resolveSessionRequest(req).sessionId;
 }
 
+function bookingRowFromDbRecord(record) {
+  const src = record && typeof record === 'object' ? record : {};
+  const createdAt = src.created_at ? new Date(src.created_at).toISOString() : nowIso();
+  const updatedAt = src.updated_at ? new Date(src.updated_at).toISOString() : createdAt;
+  return sanitizeBookingRow(src.row_data, {
+    id: String(src.id || '').trim(),
+    status: String(src.status || '').trim(),
+    snapshotVersion: toInt(src.snapshot_version, 1),
+    revision: toInt(src.revision, 1),
+    workingByUserId: String(src.working_by_user_id || '').trim(),
+    completedByUserId: String(src.completed_by_user_id || '').trim(),
+    createdAt,
+    updatedAt,
+  });
+}
+
+async function updateBookingRowRecord(client, row) {
+  const clean = sanitizeBookingRow(row || {}, {});
+  await client.query(
+    `UPDATE bookings
+     SET status = $2,
+         snapshot_version = $3,
+         revision = $4,
+         working_by_user_id = $5,
+         completed_by_user_id = $6,
+         updated_at = $7,
+         row_data = $8::jsonb
+     WHERE id = $1`,
+    [
+      clean.id,
+      bookingStatus(clean.status),
+      Math.max(1, toInt(clean.snapshotVersion, 1)),
+      Math.max(1, toInt(clean.revision, 1)),
+      String(clean.workingByUserId || '').trim(),
+      String(clean.completedByUserId || '').trim(),
+      String(clean.updatedAt || nowIso()),
+      JSON.stringify(clean),
+    ],
+  );
+}
+
+async function insertAuditLogRow(client, entry) {
+  const row = entry && typeof entry === 'object' ? entry : {};
+  await client.query(
+    `INSERT INTO audit_log (id, at, action, actor_user_id, actor_name, target_type, target_id, details)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb)`,
+    [
+      randomId('audit'),
+      String(row.at || nowIso()),
+      String(row.action || 'unknown')
+        .trim()
+        .slice(0, 80),
+      String(row.actorUserId || '').trim(),
+      String(row.actorName || '').trim(),
+      String(row.targetType || '')
+        .trim()
+        .slice(0, 60),
+      String(row.targetId || '')
+        .trim()
+        .slice(0, 120),
+      JSON.stringify(row.details && typeof row.details === 'object' ? row.details : {}),
+    ],
+  );
+}
+
+async function insertBookingEventRow(client, entry) {
+  const row = entry && typeof entry === 'object' ? entry : {};
+  await client.query(
+    `INSERT INTO booking_events (id, booking_id, event_type, actor_user_id, actor_name, details, created_at)
+     VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7)`,
+    [
+      randomId('booking-event'),
+      String(row.bookingId || '').trim(),
+      String(row.eventType || 'booking.event')
+        .trim()
+        .slice(0, 80),
+      String(row.actorUserId || '').trim(),
+      String(row.actorName || '').trim(),
+      JSON.stringify(row.details && typeof row.details === 'object' ? row.details : {}),
+      String(row.at || nowIso()),
+    ],
+  );
+}
+
 function parseCookieSameSite(value) {
   const raw = String(value || '').trim().toLowerCase();
   if (raw === 'none') return 'none';
@@ -228,6 +314,10 @@ function boolFromRequest(value, fallback = false) {
   return !!fallback;
 }
 
+function envFlagEnabled(name, fallback = false) {
+  return boolFromRequest(process.env[name], fallback);
+}
+
 async function createApp(options = {}) {
   const app = express();
   const db = options.db || createPoolFromEnv(options.dbOptions || {});
@@ -253,6 +343,25 @@ async function createApp(options = {}) {
   }
 
   const appVersion = String(process.env.APP_VERSION || `dev-${Date.now()}`);
+  const maintenanceMode = envFlagEnabled('APP_MAINTENANCE_MODE', false);
+  const maintenanceTitle =
+    String(process.env.APP_MAINTENANCE_TITLE || 'Scheduled Maintenance').trim() || 'Scheduled Maintenance';
+  const maintenanceMessage =
+    String(process.env.APP_MAINTENANCE_MESSAGE || 'We are updating the site right now. Please check back soon.').trim() ||
+    'We are updating the site right now. Please check back soon.';
+  const maintenanceRetryAfterSeconds = Math.max(
+    60,
+    toInt(process.env.APP_MAINTENANCE_RETRY_AFTER_SECONDS, 900),
+  );
+
+  function maintenanceStateSnapshot() {
+    return {
+      enabled: maintenanceMode,
+      title: maintenanceTitle,
+      message: maintenanceMessage,
+      retryAfterSeconds: maintenanceRetryAfterSeconds,
+    };
+  }
 
   function latestLocalBackupSummary() {
     try {
@@ -290,7 +399,147 @@ async function createApp(options = {}) {
     }
     const latestBackup = latestLocalBackupSummary();
     if (latestBackup) snapshot.latestBackup = latestBackup;
+    snapshot.maintenance = maintenanceStateSnapshot();
     return snapshot;
+  }
+
+  function shouldExposeRuntimeDetails(req) {
+    const permissions = requestPermissions(req);
+    return !!(permissions.manage_admin_updates || permissions.view_audit || permissions.publish_catalog);
+  }
+
+  const RATE_LIMIT_RESPONSE_MESSAGE = 'Too many requests. Please try again shortly.';
+  const RATE_LIMIT_SWEEP_INTERVAL_MS = 60_000;
+  const RATE_LIMIT_RULES = Object.freeze({
+    directAuthSignIn: Object.freeze([
+      { name: 'ip-identifier-10m', subjectScoped: true, limit: 12, windowMs: 10 * 60 * 1000 },
+      { name: 'ip-10m', subjectScoped: false, limit: 40, windowMs: 10 * 60 * 1000 },
+    ]),
+    cloudAuthLookup: Object.freeze([
+      { name: 'ip-identifier-10m', subjectScoped: true, limit: 45, windowMs: 10 * 60 * 1000 },
+      { name: 'ip-10m', subjectScoped: false, limit: 180, windowMs: 10 * 60 * 1000 },
+    ]),
+    cloudAuthSignIn: Object.freeze([
+      { name: 'ip-identifier-10m', subjectScoped: true, limit: 12, windowMs: 10 * 60 * 1000 },
+      { name: 'ip-10m', subjectScoped: false, limit: 40, windowMs: 10 * 60 * 1000 },
+    ]),
+    cloudAuthPasswordReset: Object.freeze([
+      { name: 'ip-identifier-10m', subjectScoped: true, limit: 8, windowMs: 10 * 60 * 1000 },
+      { name: 'ip-10m', subjectScoped: false, limit: 30, windowMs: 10 * 60 * 1000 },
+    ]),
+    bookingCreate: Object.freeze([
+      { name: 'ip-user-1m', subjectScoped: true, limit: 18, windowMs: 60 * 1000 },
+      { name: 'ip-10m', subjectScoped: false, limit: 90, windowMs: 10 * 60 * 1000 },
+    ]),
+  });
+  const rateLimitStore = new Map();
+  let rateLimitLastSweepAt = 0;
+
+  function requestIpText(req) {
+    const forwarded = String((req && req.headers && req.headers['x-forwarded-for']) || '')
+      .split(',')[0]
+      .trim();
+    const raw = String((req && (req.ip || (req.socket && req.socket.remoteAddress))) || forwarded || '').trim();
+    return (raw || 'unknown').replace(/^::ffff:/i, '');
+  }
+
+  function normalizeRateLimitSubject(value) {
+    return String(value || '').trim().toLowerCase();
+  }
+
+  function maskRateLimitSubject(value) {
+    const subject = String(value || '').trim();
+    if (!subject) return '';
+    return maskAuthIdentifier(subject);
+  }
+
+  function rateLimitEntryKey(scopeName, ruleName, ip, subject) {
+    return [String(scopeName || '').trim() || 'scope', String(ruleName || '').trim() || 'rule', String(ip || '').trim() || 'unknown', String(subject || '').trim() || '*'].join('|');
+  }
+
+  function getRateLimitEntry(key, windowMs) {
+    const normalizedWindowMs = Math.max(1000, toInt(windowMs, 60_000));
+    const existing = rateLimitStore.get(key);
+    if (existing && Array.isArray(existing.hits) && existing.windowMs === normalizedWindowMs) return existing;
+    const entry = { windowMs: normalizedWindowMs, hits: [] };
+    rateLimitStore.set(key, entry);
+    return entry;
+  }
+
+  function pruneRateLimitEntry(entry, nowMs) {
+    if (!entry || !Array.isArray(entry.hits)) return;
+    const windowMs = Math.max(1000, toInt(entry.windowMs, 60_000));
+    entry.hits = entry.hits.filter((stamp) => Number.isFinite(stamp) && stamp > nowMs - windowMs);
+  }
+
+  function sweepRateLimitStore(nowMs = Date.now()) {
+    if (nowMs - rateLimitLastSweepAt < RATE_LIMIT_SWEEP_INTERVAL_MS) return;
+    for (const [key, entry] of rateLimitStore.entries()) {
+      if (!entry || !Array.isArray(entry.hits)) {
+        rateLimitStore.delete(key);
+        continue;
+      }
+      pruneRateLimitEntry(entry, nowMs);
+      if (!entry.hits.length) rateLimitStore.delete(key);
+    }
+    rateLimitLastSweepAt = nowMs;
+  }
+
+  function rateLimitRetryAfterSeconds(entry, nowMs) {
+    if (!(entry && Array.isArray(entry.hits) && entry.hits.length)) return 1;
+    const windowMs = Math.max(1000, toInt(entry.windowMs, 60_000));
+    const oldest = Number(entry.hits[0]) || nowMs;
+    return Math.max(1, Math.ceil((oldest + windowMs - nowMs) / 1000));
+  }
+
+  function logRateLimitRejection(scopeName, req, details = {}) {
+    const src = details && typeof details === 'object' ? details : {};
+    const ip = requestIpText(req);
+    const subject = maskRateLimitSubject(src.subject);
+    const limit = Math.max(1, toInt(src.limit, 1));
+    const windowMs = Math.max(1000, toInt(src.windowMs, 60_000));
+    const ruleName = String(src.ruleName || 'rule').trim() || 'rule';
+    console.warn(
+      `[rate-limit.reject] scope=${String(scopeName || '').trim() || 'scope'} rule=${ruleName} ip=${ip} subject=${subject || 'n/a'} limit=${limit} window_ms=${windowMs}`,
+    );
+  }
+
+  function writeRateLimitResponse(res, retryAfterSeconds) {
+    const retryAfter = Math.max(1, toInt(retryAfterSeconds, 1));
+    res.set('Retry-After', String(retryAfter));
+    res.status(429).json({ ok: false, code: 'RATE_LIMITED', message: RATE_LIMIT_RESPONSE_MESSAGE });
+  }
+
+  function enforceRateLimit(req, res, scopeName, subject, rules) {
+    const list = Array.isArray(rules) ? rules : [];
+    if (!list.length) return true;
+    const nowMs = Date.now();
+    const ip = requestIpText(req);
+    const normalizedSubject = normalizeRateLimitSubject(subject);
+    const pendingEntries = [];
+    sweepRateLimitStore(nowMs);
+    for (const rule of list) {
+      const subjectKey = rule && rule.subjectScoped ? normalizedSubject : '';
+      if (rule && rule.subjectScoped && !subjectKey) continue;
+      const key = rateLimitEntryKey(scopeName, rule && rule.name, ip, subjectKey);
+      const entry = getRateLimitEntry(key, rule && rule.windowMs);
+      pruneRateLimitEntry(entry, nowMs);
+      if (entry.hits.length >= Math.max(1, toInt(rule && rule.limit, 1))) {
+        logRateLimitRejection(scopeName, req, {
+          subject: normalizedSubject,
+          ruleName: rule && rule.name,
+          limit: rule && rule.limit,
+          windowMs: rule && rule.windowMs,
+        });
+        writeRateLimitResponse(res, rateLimitRetryAfterSeconds(entry, nowMs));
+        return false;
+      }
+      pendingEntries.push(entry);
+    }
+    pendingEntries.forEach((entry) => {
+      entry.hits.push(nowMs);
+    });
+    return true;
   }
 
   app.use(
@@ -325,6 +574,27 @@ async function createApp(options = {}) {
       secure: cookieSecure,
       path: '/',
     });
+  }
+
+  function requestAllowedDuringMaintenance(req) {
+    const pathname = String((req && req.path) || '').trim() || '/';
+    return pathname === '/api/health' || pathname === '/version.json';
+  }
+
+  function writeMaintenanceResponse(req, res) {
+    const maintenance = maintenanceStateSnapshot();
+    res.set('Retry-After', String(maintenance.retryAfterSeconds));
+    clearSessionCookie(res);
+    if (String((req && req.path) || '').trim().startsWith('/api/')) {
+      res.status(503).json({
+        ok: false,
+        code: 'MAINTENANCE_MODE',
+        message: maintenance.message,
+        maintenance,
+      });
+      return;
+    }
+    res.status(503).type('text/plain; charset=utf-8').send(`${maintenance.title}\n\n${maintenance.message}\n`);
   }
 
   async function createSession(userId, activeRole) {
@@ -471,7 +741,133 @@ async function createApp(options = {}) {
     return normalizeRole((req && req.auth && req.auth.payload && req.auth.payload.role) || (req && req.auth && req.auth.session && req.auth.session.activeRole));
   }
 
-  function resolveAuthorizedUserOperations(req, rawInput) {
+  function userMutationConflictLabel(user) {
+    const row = user && typeof user === 'object' ? user : {};
+    const role = normalizeRole(row.role) || 'marketer';
+    if (role === 'admin') {
+      return row.isAssistant ? 'Admin' : 'Primary Admin';
+    }
+    return 'Marketer';
+  }
+
+  function userMutationConflictMessage(fieldLabel, user) {
+    const row = user && typeof user === 'object' ? user : {};
+    const name =
+      String(row.displayName || '').trim() ||
+      `${String(row.firstName || '').trim()} ${String(row.lastName || '').trim()}`.trim() ||
+      'User';
+    const statusPrefix = normalizeStatus(row.status || 'active') === 'inactive' ? 'inactive ' : '';
+    return `That ${String(fieldLabel || 'value').trim() || 'value'} already exists on ${statusPrefix}${userMutationConflictLabel(row)} '${name}'.`;
+  }
+
+  function userMutationCloneState(dbState) {
+    const source = Array.isArray(dbState && dbState.users) ? dbState.users : [];
+    try {
+      return { users: JSON.parse(JSON.stringify(source)) };
+    } catch {
+      return {
+        users: source.map((row) => (row && typeof row === 'object' ? { ...row } : row)),
+      };
+    }
+  }
+
+  function findUserTargetForOperation(users, op) {
+    const list = Array.isArray(users) ? users : [];
+    const metadata = op && op.metadata && typeof op.metadata === 'object' && !Array.isArray(op.metadata) ? op.metadata : {};
+    const localUserId = String(metadata.local_user_id ?? metadata.localUserId ?? '').trim();
+    const previousWwid = normalizeWwid(metadata.previous_wwid ?? metadata.previousWwid ?? '');
+    if (localUserId) {
+      const byId =
+        list.find((entry) => entry && typeof entry === 'object' && String(entry.id || '').trim() === localUserId) || null;
+      if (byId) return byId;
+    }
+    return (
+      list.find((entry) => {
+        if (!entry || typeof entry !== 'object') return false;
+        const entryWwid = normalizeWwid(entry.wwid);
+        return entryWwid === op.wwid || (!!previousWwid && entryWwid === previousWwid);
+      }) || null
+    );
+  }
+
+  function isRetainedPrimaryAdmin(user) {
+    const row = user && typeof user === 'object' ? user : {};
+    return normalizeRole(row.role) === 'admin' && !row.isAssistant && normalizeStatus(row.status || 'active') !== 'deleted';
+  }
+
+  function validateUserOperationsAgainstState(dbState, userOps, context = {}) {
+    const list = Array.isArray(userOps) ? userOps : [];
+    const actorUser = context.actorUser && typeof context.actorUser === 'object' ? context.actorUser : {};
+    const canAdmin = !!context.canAdmin;
+    const canManager = !!context.canManager;
+    const shadow = userMutationCloneState(dbState);
+    const actor = {
+      userId: String(actorUser.id || '').trim(),
+      name: String(actorUser.displayName || '').trim(),
+    };
+    for (const op of list) {
+      const metadata = op && op.metadata && typeof op.metadata === 'object' && !Array.isArray(op.metadata) ? op.metadata : {};
+      const target = findUserTargetForOperation(shadow.users, op);
+      const desiredWwid = normalizeWwid(op && op.wwid);
+      const desiredEmail = normalizeEmail(metadata.work_email ?? metadata.email ?? '');
+
+      if (canManager && !canAdmin && op.op !== 'create_user' && target && !sharesDepartmentScope(actorUser.departmentIds, target.departmentIds)) {
+        return {
+          ok: false,
+          status: 403,
+          body: { ok: false, message: 'Managers can only update users in their assigned departments.' },
+        };
+      }
+
+      if (op.op === 'update_user' && target && isRetainedPrimaryAdmin(target) && String(op.role || '').trim().toLowerCase() !== 'primary_admin') {
+        const primaryAdmins = (Array.isArray(shadow.users) ? shadow.users : []).filter((row) => isRetainedPrimaryAdmin(row));
+        if (primaryAdmins.length <= 1) {
+          return {
+            ok: false,
+            status: 400,
+            body: { ok: false, message: 'At least one Primary Admin must remain.' },
+          };
+        }
+      }
+
+      if (op.op === 'create_user' || op.op === 'update_user') {
+        const excludeId = target ? String(target.id || '').trim() : '';
+        const wwidConflict = (Array.isArray(shadow.users) ? shadow.users : []).find((row) => {
+          if (!row || typeof row !== 'object') return false;
+          if (normalizeStatus(row.status || 'active') === 'deleted') return false;
+          if (excludeId && String(row.id || '').trim() === excludeId) return false;
+          return normalizeWwid(row.wwid) === desiredWwid;
+        });
+        if (wwidConflict) {
+          return {
+            ok: false,
+            status: 409,
+            body: { ok: false, message: userMutationConflictMessage('WWID', wwidConflict) },
+          };
+        }
+        if (desiredEmail) {
+          const emailConflict = (Array.isArray(shadow.users) ? shadow.users : []).find((row) => {
+            if (!row || typeof row !== 'object') return false;
+            if (normalizeStatus(row.status || 'active') === 'deleted') return false;
+            if (excludeId && String(row.id || '').trim() === excludeId) return false;
+            return normalizeEmail(row.email) === desiredEmail;
+          });
+          if (emailConflict) {
+            return {
+              ok: false,
+              status: 409,
+              body: { ok: false, message: userMutationConflictMessage('email', emailConflict) },
+            };
+          }
+        }
+      }
+
+      applyUserOperation(shadow, op, actor, () => {});
+    }
+    return { ok: true, userOps: list, canAdmin, canManager };
+  }
+
+  function resolveAuthorizedUserOperations(dbState, req, rawInput) {
     const rawList = Array.isArray(rawInput) ? rawInput : [];
     let userOps = normalizeUserOperations(rawInput);
     if (rawList.length !== userOps.length) {
@@ -530,7 +926,11 @@ async function createApp(options = {}) {
       }
       userOps = normalizeManagerScopedUserOperations(userOps, req.auth.user);
     }
-    return { ok: true, userOps, canAdmin, canManager };
+    return validateUserOperationsAgainstState(dbState, userOps, {
+      canAdmin,
+      canManager,
+      actorUser: req && req.auth ? req.auth.user : null,
+    });
   }
 
   function normalizeDepartmentScope(value) {
@@ -663,43 +1063,60 @@ async function createApp(options = {}) {
     return false;
   }
 
+  function maskAuthIdentifier(identifier) {
+    const value = String(identifier || '').trim();
+    if (!value) return '';
+    if (value.includes('@')) {
+      const [localPart, domainPart] = value.split('@');
+      const local = String(localPart || '').trim();
+      const domain = String(domainPart || '').trim();
+      const visibleLocal = local ? `${local.slice(0, 1)}***` : '***';
+      return `${visibleLocal}${domain ? `@${domain}` : ''}`;
+    }
+    if (value.length <= 4) return `${value.slice(0, 1)}***`;
+    return `${value.slice(0, 2)}***${value.slice(-2)}`;
+  }
+
+  function logPublicAuthRejection(kind, details = {}) {
+    const src = details && typeof details === 'object' ? details : {};
+    const role = normalizeRole(src.role) || 'unknown';
+    const identifier = maskAuthIdentifier(src.identifier);
+    const reason = String(src.reason || 'unknown').trim() || 'unknown';
+    console.warn(`[auth.${String(kind || 'request').trim() || 'request'}.reject] role=${role} identifier=${identifier || 'unknown'} reason=${reason}`);
+  }
+
   async function signInCore(identifier, password, requestedRole) {
-    const row = await findUserRowByIdentifier(db, identifier, requestedRole);
-    if (!row) {
+    const normalizedIdentifier = normalizeIdentifier(identifier);
+    const requestedRoleKey = normalizeRole(requestedRole) || '';
+    const genericMessage = 'Could not sign in with those credentials.';
+    const buildFailure = (reason, options = {}) => {
+      const o = options && typeof options === 'object' ? options : {};
+      logPublicAuthRejection('sign_in', { role: requestedRoleKey, identifier: normalizedIdentifier, reason });
+      const body = { ok: false, code: 'AUTH_FAILED', message: genericMessage };
+      if (o.allowFallback) body.fallback_allowed = true;
       return {
         status: 401,
-        body: { ok: false, message: 'No active account matched this WWID/work email.' },
+        body,
         user: null,
         activeRole: null,
       };
+    };
+    const row = await findUserRowByIdentifier(db, normalizedIdentifier, requestedRoleKey);
+    if (!row) {
+      return buildFailure('missing_user', { allowFallback: requestedRoleKey === 'admin' });
     }
     const user = mapUserToState(row);
     if (user.isLocked) {
-      return {
-        status: 403,
-        body: { ok: false, message: 'This account is locked. Contact admin support.' },
-        user: null,
-        activeRole: null,
-      };
+      return buildFailure('locked_user');
     }
     if (!verifyPassword(password, user.passwordHash)) {
-      return {
-        status: 401,
-        body: { ok: false, message: 'Password did not match.' },
-        user: null,
-        activeRole: null,
-      };
+      return buildFailure('password_mismatch', { allowFallback: requestedRoleKey === 'admin' });
     }
     const access = deriveAccess(user);
     if (!access.availableRoles.length) {
-      return {
-        status: 403,
-        body: { ok: false, message: 'This account has no enabled roles.' },
-        user: null,
-        activeRole: null,
-      };
+      return buildFailure('no_enabled_roles');
     }
-    const activeRole = requestedRole && access.availableRoles.includes(requestedRole) ? requestedRole : access.availableRoles[0];
+    const activeRole = requestedRoleKey && access.availableRoles.includes(requestedRoleKey) ? requestedRoleKey : access.availableRoles[0];
     return { status: 200, body: { ok: true, message: `Signed in as ${activeRole}.` }, user, activeRole };
   }
 
@@ -888,8 +1305,24 @@ async function createApp(options = {}) {
 
   app.use(attachAuth);
 
-  app.get('/api/health', (_req, res) => {
-    res.json({ ok: true, service: 'marketingtool-backend', at: nowIso(), version: appVersion, runtime: runtimeSnapshot() });
+  app.get('/api/health', (req, res) => {
+    const body = {
+      ok: true,
+      service: 'marketingtool-backend',
+      at: nowIso(),
+      version: appVersion,
+      maintenance: maintenanceStateSnapshot(),
+    };
+    if (shouldExposeRuntimeDetails(req)) body.runtime = runtimeSnapshot();
+    res.json(body);
+  });
+
+  app.use((req, res, next) => {
+    if (!maintenanceMode || requestAllowedDuringMaintenance(req)) {
+      next();
+      return;
+    }
+    writeMaintenanceResponse(req, res);
   });
 
   app.get('/api/users', requireSession, async (req, res, next) => {
@@ -991,9 +1424,12 @@ async function createApp(options = {}) {
     }
   });
 
-  app.get('/version.json', (_req, res) => {
+  app.get('/version.json', (req, res) => {
     res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0');
-    res.json({ ok: true, version: appVersion, updatedAt: nowIso(), runtime: runtimeSnapshot() });
+    const body = { ok: true, version: appVersion, updatedAt: nowIso() };
+    if (maintenanceMode) body.maintenance = maintenanceStateSnapshot();
+    if (shouldExposeRuntimeDetails(req)) body.runtime = runtimeSnapshot();
+    res.json(body);
   });
 
   app.post('/api/auth/sign-in', async (req, res, next) => {
@@ -1005,9 +1441,12 @@ async function createApp(options = {}) {
         res.status(400).json({ ok: false, message: 'WWID/work email and password are required.' });
         return;
       }
+      if (!enforceRateLimit(req, res, 'auth.sign_in', identifier, RATE_LIMIT_RULES.directAuthSignIn)) return;
       const signIn = await signInCore(identifier, password, requestedRole);
       if (!signIn.body.ok || !signIn.user) {
-        res.status(signIn.status).json(signIn.body);
+        const body = { ...signIn.body };
+        delete body.fallback_allowed;
+        res.status(signIn.status).json(body);
         return;
       }
       const sessionId = await createSession(signIn.user.id, signIn.activeRole);
@@ -1133,7 +1572,7 @@ async function createApp(options = {}) {
       next(error);
     }
   });
-  app.get('/api/bookings', requireSession, async (_req, res) => {
+  app.get('/api/bookings', requireSession, requirePermission('booking_manage'), async (_req, res) => {
     const state = await readDb(db);
     const rows = Array.isArray(state.bookings)
       ? state.bookings.filter((row) => bookingStatus(row.status) !== 'deleted')
@@ -1143,6 +1582,8 @@ async function createApp(options = {}) {
 
   app.post('/api/bookings', requireSession, requirePermission('booking_create'), async (req, res, next) => {
     try {
+      const actorUserId = req && req.auth && req.auth.user ? String(req.auth.user.id || '').trim() : '';
+      if (!enforceRateLimit(req, res, 'booking.create', actorUserId, RATE_LIMIT_RULES.bookingCreate)) return;
       let responseStatus = 201;
       let responseBody = null;
       await withDb(db, async (db) => {
@@ -1383,26 +1824,25 @@ async function createApp(options = {}) {
       if (action === 'auth_lookup') {
         const identifier = normalizeIdentifier(body.identifier);
         if (!identifier) {
-          res.json({ ok: true, found: false, account_state: 'missing', message: 'Identifier is required.' });
+          res.json({ ok: true, found: false, account_state: 'unknown', message: 'Identifier is required.' });
           return;
         }
+        if (!enforceRateLimit(req, res, 'cloud.auth_lookup', identifier, RATE_LIMIT_RULES.cloudAuthLookup)) return;
         const requestedRole = normalizeRole(body.role);
         const row = await findUserRowByIdentifier(db, identifier, requestedRole);
         const user = row ? mapUserToState(row) : null;
         if (!user) {
-          res.json({ ok: true, found: false, account_state: 'missing', message: 'No account matched that role and login.' });
+          res.json({ ok: true, found: false, account_state: 'unknown', message: 'Lookup complete.' });
           return;
         }
         res.json({
           ok: true,
           found: true,
-          account_state: 'ready',
-          message: 'Cloud account found.',
+          account_state: 'available',
+          message: 'Lookup complete.',
           user: {
             role: requestedRole || 'marketer',
-            status: user.status,
-            force_password_reset: !!user.forcePasswordReset,
-            cloud_account_state: 'ready',
+            cloud_account_state: 'available',
           },
         });
         return;
@@ -1437,9 +1877,17 @@ async function createApp(options = {}) {
         return;
       }
       if (action === 'auth_sign_in') {
-        const signIn = await signInCore(normalizeIdentifier(body.identifier), String(body.password || ''), normalizeRole(body.role));
+        const identifier = normalizeIdentifier(body.identifier);
+        if (!enforceRateLimit(req, res, 'cloud.auth_sign_in', identifier, RATE_LIMIT_RULES.cloudAuthSignIn)) return;
+        const signIn = await signInCore(identifier, String(body.password || ''), normalizeRole(body.role));
         if (!signIn.body.ok || !signIn.user) {
-          res.status(200).json({ ok: false, hard_fail: true, message: signIn.body.message });
+          res.status(200).json({
+            ok: false,
+            hard_fail: true,
+            code: String(signIn.body.code || 'AUTH_FAILED'),
+            fallback_allowed: !!signIn.body.fallback_allowed,
+            message: signIn.body.message,
+          });
           return;
         }
         const sessionId = await createSession(signIn.user.id, signIn.activeRole);
@@ -1463,6 +1911,7 @@ async function createApp(options = {}) {
         const role = normalizeRole(body.role) || 'marketer';
         const currentPassword = String(body.current_password || '').trim();
         const newPassword = String(body.new_password || '').trim();
+        const genericResetMessage = 'Could not update password with those details.';
         if (!identifier || !currentPassword || !newPassword) {
           res.status(200).json({ ok: false, message: 'Password reset details are incomplete.' });
           return;
@@ -1471,13 +1920,16 @@ async function createApp(options = {}) {
           res.status(200).json({ ok: false, message: 'New password must include at least 1 capital letter and at least 1 number.' });
           return;
         }
+        if (!enforceRateLimit(req, res, 'cloud.auth_complete_password_reset', identifier, RATE_LIMIT_RULES.cloudAuthPasswordReset)) return;
         const row = await findUserRowByIdentifier(db, identifier, role);
         if (!row) {
-          res.status(200).json({ ok: false, message: 'No active account matched that role + login.' });
+          logPublicAuthRejection('password_reset', { role, identifier, reason: 'missing_user' });
+          res.status(200).json({ ok: false, code: 'AUTH_RESET_FAILED', message: genericResetMessage });
           return;
         }
         if (!verifyPassword(currentPassword, row.password_hash || '')) {
-          res.status(200).json({ ok: false, message: 'Current password did not match.' });
+          logPublicAuthRejection('password_reset', { role, identifier, reason: 'password_mismatch' });
+          res.status(200).json({ ok: false, code: 'AUTH_RESET_FAILED', message: genericResetMessage });
           return;
         }
         if (currentPassword === newPassword) {
@@ -1486,11 +1938,12 @@ async function createApp(options = {}) {
         }
         const newHash = hashPassword(newPassword);
         const updatedAt = nowIso();
-        await updateUserPassword(db, row.id, newHash, false, updatedAt);
+        await updateUserPassword(db, row.id, newHash, false, updatedAt, true);
         const updatedRow = {
           ...row,
           password_hash: newHash,
           force_password_reset: false,
+          is_locked: false,
           updated_at: updatedAt,
         };
         const user = mapUserToState(updatedRow);
@@ -1663,10 +2116,17 @@ async function createApp(options = {}) {
           return;
         }
 
-        const manageResponse = await withDb(db, async (db) => {
-          const rows = Array.isArray(db.bookings) ? db.bookings : [];
-          const found = rows.find((entry) => String(entry.id || '') === requestId && bookingStatus(entry.status) !== 'deleted');
-          if (!found) {
+        const manageResponse = await withLockedWriteTransaction(db, async (client) => {
+          const bookingRecordRes = await client.query(
+            `SELECT id, status, snapshot_version, revision, working_by_user_id, completed_by_user_id, created_at, updated_at, row_data
+             FROM bookings
+             WHERE id = $1
+             FOR UPDATE`,
+            [requestId],
+          );
+          const bookingRecord = bookingRecordRes.rows[0] || null;
+          const found = bookingRecord ? bookingRowFromDbRecord(bookingRecord) : null;
+          if (!found || bookingStatus(found.status) === 'deleted') {
             return { status: 200, body: { ok: false, reason: 'missing', message: 'Booking request was not found.' } };
           }
 
@@ -1674,6 +2134,7 @@ async function createApp(options = {}) {
           const actorUserId = String(req.auth.user.id || '').trim();
           const actorDevice = String(body.actor_device || body.device_id || 'web').trim();
           const status = bookingStatus(found.status);
+          const stamp = nowIso();
 
           if (action === 'booking_claim') {
             if (status === 'done') {
@@ -1690,7 +2151,6 @@ async function createApp(options = {}) {
                 },
               };
             }
-            const stamp = nowIso();
             found.status = 'working';
             found.adminName = actorName;
             found.adminUserId = actorUserId;
@@ -1702,8 +2162,18 @@ async function createApp(options = {}) {
             found.statusAt = stamp;
             found.updatedAt = stamp;
             found.revision = Math.max(1, toInt(found.revision, 1) + 1);
-            logAudit(db, { action: 'booking.claim', actorUserId, actorName, targetType: 'booking', targetId: found.id, details: { source: 'cloud' } });
-            logBookingEvent(db, {
+            await updateBookingRowRecord(client, found);
+            await insertAuditLogRow(client, {
+              at: stamp,
+              action: 'booking.claim',
+              actorUserId,
+              actorName,
+              targetType: 'booking',
+              targetId: found.id,
+              details: { source: 'cloud' },
+            });
+            await insertBookingEventRow(client, {
+              at: stamp,
               bookingId: found.id,
               eventType: 'booking.claim',
               actorUserId,
@@ -1731,7 +2201,6 @@ async function createApp(options = {}) {
                 },
               };
             }
-            const stamp = nowIso();
             found.status = 'done';
             found.completedByName = actorName;
             found.completedByUserId = actorUserId;
@@ -1740,8 +2209,18 @@ async function createApp(options = {}) {
             found.statusAt = stamp;
             found.updatedAt = stamp;
             found.revision = Math.max(1, toInt(found.revision, 1) + 1);
-            logAudit(db, { action: 'booking.complete', actorUserId, actorName, targetType: 'booking', targetId: found.id, details: { source: 'cloud' } });
-            logBookingEvent(db, {
+            await updateBookingRowRecord(client, found);
+            await insertAuditLogRow(client, {
+              at: stamp,
+              action: 'booking.complete',
+              actorUserId,
+              actorName,
+              targetType: 'booking',
+              targetId: found.id,
+              details: { source: 'cloud' },
+            });
+            await insertBookingEventRow(client, {
+              at: stamp,
               bookingId: found.id,
               eventType: 'booking.complete',
               actorUserId,
@@ -1769,11 +2248,21 @@ async function createApp(options = {}) {
           found.completedByUserId = '';
           found.completedByDevice = '';
           found.completedAt = '';
-          found.statusAt = nowIso();
-          found.updatedAt = nowIso();
+          found.statusAt = stamp;
+          found.updatedAt = stamp;
           found.revision = Math.max(1, toInt(found.revision, 1) + 1);
-          logAudit(db, { action: 'booking.release', actorUserId, actorName, targetType: 'booking', targetId: found.id, details: { source: 'cloud' } });
-          logBookingEvent(db, {
+          await updateBookingRowRecord(client, found);
+          await insertAuditLogRow(client, {
+            at: stamp,
+            action: 'booking.release',
+            actorUserId,
+            actorName,
+            targetType: 'booking',
+            targetId: found.id,
+            details: { source: 'cloud' },
+          });
+          await insertBookingEventRow(client, {
+            at: stamp,
             bookingId: found.id,
             eventType: 'booking.release',
             actorUserId,
@@ -1790,7 +2279,7 @@ async function createApp(options = {}) {
           const permissions = req.auth.payload.permissions || {};
           if (!permissions.publish_catalog) return { status: 403, body: { ok: false, message: 'Only admins can publish snapshots.' } };
           const payload = sanitizeCatalogPayload(body.payload);
-          const operationResolution = resolveAuthorizedUserOperations(req, body.user_operations);
+          const operationResolution = resolveAuthorizedUserOperations(db, req, body.user_operations);
           if (!operationResolution.ok) {
             return { status: operationResolution.status, body: operationResolution.body };
           }
@@ -1827,7 +2316,7 @@ async function createApp(options = {}) {
       }
       if (action === 'apply_user_operations') {
         const result = await withDb(db, async (db) => {
-          const operationResolution = resolveAuthorizedUserOperations(req, body.user_operations || body.operations);
+          const operationResolution = resolveAuthorizedUserOperations(db, req, body.user_operations || body.operations);
           if (!operationResolution.ok) {
             return { status: operationResolution.status, body: operationResolution.body };
           }
@@ -1868,10 +2357,11 @@ async function createApp(options = {}) {
   });
 
   app.use((error, _req, res, _next) => {
+    const errorId = randomId('err');
     const message = String((error && error.message) || error || 'Server error');
-    console.error(error && error.stack ? error.stack : message);
+    console.error(`[${errorId}]`, error && error.stack ? error.stack : message);
     if (res.headersSent) return;
-    res.status(500).json({ ok: false, message });
+    res.status(500).json({ ok: false, code: 'INTERNAL_ERROR', message: 'Internal server error.', error_id: errorId });
   });
 
   return { app, db, ownsDbPool };
