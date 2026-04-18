@@ -100,6 +100,25 @@ CREATE TABLE IF NOT EXISTS audit_log (
 
 CREATE INDEX IF NOT EXISTS idx_audit_log_at ON audit_log(at DESC);
 
+CREATE TABLE IF NOT EXISTS booking_log_archives (
+  month_key TEXT PRIMARY KEY,
+  month_label TEXT NOT NULL DEFAULT '',
+  state TEXT NOT NULL DEFAULT 'archived',
+  entry_count INTEGER NOT NULL DEFAULT 0,
+  done_count INTEGER NOT NULL DEFAULT 0,
+  canceled_count INTEGER NOT NULL DEFAULT 0,
+  created_at TIMESTAMPTZ NOT NULL,
+  created_by_user_id TEXT NULL REFERENCES users(id),
+  created_by_name TEXT NOT NULL DEFAULT '',
+  deleted_at TIMESTAMPTZ NULL,
+  deleted_by_user_id TEXT NULL REFERENCES users(id),
+  deleted_by_name TEXT NOT NULL DEFAULT '',
+  payload JSONB NOT NULL DEFAULT '{}'::jsonb
+);
+
+CREATE INDEX IF NOT EXISTS idx_booking_log_archives_state ON booking_log_archives(state);
+CREATE INDEX IF NOT EXISTS idx_booking_log_archives_created_at ON booking_log_archives(created_at DESC);
+
 ALTER TABLE users ADD COLUMN IF NOT EXISTS force_password_reset BOOLEAN NOT NULL DEFAULT FALSE;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS department_ids JSONB NOT NULL DEFAULT '[]'::jsonb;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS phone TEXT NOT NULL DEFAULT '';

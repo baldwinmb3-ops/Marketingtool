@@ -211,6 +211,217 @@ async function updateBookingRowRecord(client, booking) {
   );
 }
 
+function bookingHistoryStamp(booking) {
+  const row = booking && typeof booking === 'object' ? booking : {};
+  return String(row.completedAt || row.statusAt || row.updatedAt || row.createdAt || nowIso()).trim() || nowIso();
+}
+
+function bookingHistoryMonthKeyFromStamp(stamp) {
+  const value = String(stamp || '').trim();
+  if (!value) return '';
+  const date = new Date(value);
+  if (!Number.isFinite(date.getTime())) return '';
+  return `${date.getUTCFullYear()}-${String(date.getUTCMonth() + 1).padStart(2, '0')}`;
+}
+
+function bookingHistoryDayKeyFromStamp(stamp) {
+  const value = String(stamp || '').trim();
+  if (!value) return '';
+  const date = new Date(value);
+  if (!Number.isFinite(date.getTime())) return '';
+  return `${date.getUTCFullYear()}-${String(date.getUTCMonth() + 1).padStart(2, '0')}-${String(date.getUTCDate()).padStart(2, '0')}`;
+}
+
+function bookingHistoryMonthLabel(monthKey) {
+  const match = /^(\d{4})-(\d{2})$/.exec(String(monthKey || '').trim());
+  if (!match) return String(monthKey || 'Unknown Month').trim() || 'Unknown Month';
+  const date = new Date(Date.UTC(Number.parseInt(match[1], 10), Number.parseInt(match[2], 10) - 1, 1));
+  if (!Number.isFinite(date.getTime())) return String(monthKey || 'Unknown Month').trim() || 'Unknown Month';
+  return new Intl.DateTimeFormat('en-US', { month: 'long', year: 'numeric', timeZone: 'UTC' }).format(date);
+}
+
+function bookingHistoryDayLabel(dayKey) {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(dayKey || '').trim());
+  if (!match) return String(dayKey || 'Unknown Day').trim() || 'Unknown Day';
+  const date = new Date(Date.UTC(Number.parseInt(match[1], 10), Number.parseInt(match[2], 10) - 1, Number.parseInt(match[3], 10)));
+  if (!Number.isFinite(date.getTime())) return String(dayKey || 'Unknown Day').trim() || 'Unknown Day';
+  return new Intl.DateTimeFormat('en-US', {
+    weekday: 'long',
+    month: 'short',
+    day: 'numeric',
+    year: 'numeric',
+    timeZone: 'UTC',
+  }).format(date);
+}
+
+function bookingHistoryRowStatusKey(booking) {
+  const status = bookingStatus(booking && booking.status);
+  if (status === 'done') return 'done';
+  if (status === 'deleted') return 'deleted';
+  return '';
+}
+
+function bookingHistoryMonthSummaryFromPayload(payload) {
+  const src = payload && typeof payload === 'object' && !Array.isArray(payload) ? payload : {};
+  return {
+    monthKey: String(src.monthKey || '').trim(),
+    monthLabel: String(src.monthLabel || '').trim(),
+    entryCount: Math.max(0, toInt(src.entryCount, 0)),
+    doneCount: Math.max(0, toInt(src.doneCount, 0)),
+    canceledCount: Math.max(0, toInt(src.canceledCount, 0)),
+  };
+}
+
+function buildBookingHistoryMonthPayload(rows, monthKey) {
+  const targetMonthKey = String(monthKey || '').trim();
+  if (!/^\d{4}-\d{2}$/.test(targetMonthKey)) {
+    return {
+      monthKey: targetMonthKey,
+      monthLabel: bookingHistoryMonthLabel(targetMonthKey),
+      entryCount: 0,
+      doneCount: 0,
+      canceledCount: 0,
+      days: [],
+    };
+  }
+  const dayMap = new Map();
+  let doneCount = 0;
+  let canceledCount = 0;
+  (Array.isArray(rows) ? rows : []).forEach((entry) => {
+    const booking = entry && typeof entry === 'object' ? { ...entry } : null;
+    if (!booking || !String(booking.id || '').trim()) return;
+    const statusKey = bookingHistoryRowStatusKey(booking);
+    if (!statusKey) return;
+    const stamp = bookingHistoryStamp(booking);
+    const bookingMonthKey = bookingHistoryMonthKeyFromStamp(stamp);
+    if (bookingMonthKey !== targetMonthKey) return;
+    const dayKey = bookingHistoryDayKeyFromStamp(stamp);
+    if (!dayKey) return;
+    if (!dayMap.has(dayKey)) {
+      dayMap.set(dayKey, {
+        dateKey: dayKey,
+        dateLabel: bookingHistoryDayLabel(dayKey),
+        weekdayLabel: bookingHistoryDayLabel(dayKey),
+        rows: [],
+        doneCount: 0,
+        canceledCount: 0,
+      });
+    }
+    const group = dayMap.get(dayKey);
+    const nextRow = {
+      ...booking,
+      historyStatus: statusKey,
+      historyStamp: stamp,
+      historyDateKey: dayKey,
+    };
+    group.rows.push(nextRow);
+    if (statusKey === 'done') {
+      doneCount += 1;
+      group.doneCount += 1;
+    } else {
+      canceledCount += 1;
+      group.canceledCount += 1;
+    }
+  });
+  const days = Array.from(dayMap.values())
+    .map((group) => ({
+      dateKey: group.dateKey,
+      dateLabel: group.dateLabel,
+      weekdayLabel: group.weekdayLabel,
+      entryCount: group.rows.length,
+      doneCount: group.doneCount,
+      canceledCount: group.canceledCount,
+      rows: group.rows
+        .slice()
+        .sort((a, b) => Date.parse(String(b.historyStamp || '')) - Date.parse(String(a.historyStamp || ''))),
+    }))
+    .sort((a, b) => String(b.dateKey || '').localeCompare(String(a.dateKey || '')));
+  return {
+    monthKey: targetMonthKey,
+    monthLabel: bookingHistoryMonthLabel(targetMonthKey),
+    entryCount: doneCount + canceledCount,
+    doneCount,
+    canceledCount,
+    days,
+  };
+}
+
+async function loadBookingHistorySourceRows(client) {
+  const result = await client.query(
+    `SELECT id, status, snapshot_version, revision, working_by_user_id, completed_by_user_id, created_at, updated_at, row_data
+       FROM bookings
+      WHERE LOWER(COALESCE(status, 'pending')) IN ('done', 'deleted')
+      ORDER BY updated_at DESC`,
+  );
+  return (Array.isArray(result.rows) ? result.rows : [])
+    .map((row) => bookingRowFromDbRecord(row))
+    .filter((booking) => !!bookingHistoryRowStatusKey(booking));
+}
+
+function bookingHistoryCurrentMonthKey() {
+  return bookingHistoryMonthKeyFromStamp(nowIso());
+}
+
+function bookingHistoryAvailableMonthSummaries(rows, options = {}) {
+  const opts = options && typeof options === 'object' ? options : {};
+  const currentMonthKey = String(opts.currentMonthKey || bookingHistoryCurrentMonthKey()).trim();
+  const excludedMonthKeys = opts.excludeMonthKeys instanceof Set ? opts.excludeMonthKeys : new Set();
+  const months = new Map();
+  (Array.isArray(rows) ? rows : []).forEach((entry) => {
+    const booking = entry && typeof entry === 'object' ? entry : null;
+    if (!booking) return;
+    const statusKey = bookingHistoryRowStatusKey(booking);
+    if (!statusKey) return;
+    const monthKey = bookingHistoryMonthKeyFromStamp(bookingHistoryStamp(booking));
+    if (!/^\d{4}-\d{2}$/.test(monthKey)) return;
+    if (currentMonthKey && monthKey >= currentMonthKey) return;
+    if (excludedMonthKeys.has(monthKey)) return;
+    if (!months.has(monthKey)) {
+      months.set(monthKey, {
+        monthKey,
+        monthLabel: bookingHistoryMonthLabel(monthKey),
+        entryCount: 0,
+        doneCount: 0,
+        canceledCount: 0,
+      });
+    }
+    const summary = months.get(monthKey);
+    summary.entryCount += 1;
+    if (statusKey === 'done') summary.doneCount += 1;
+    if (statusKey === 'deleted') summary.canceledCount += 1;
+  });
+  return Array.from(months.values()).sort((a, b) => String(b.monthKey || '').localeCompare(String(a.monthKey || '')));
+}
+
+async function loadBookingHistoryArchiveRows(client, options = {}) {
+  const includeDeleted = !!(options && options.includeDeleted);
+  const result = await client.query(
+    `SELECT month_key, month_label, state, entry_count, done_count, canceled_count, created_at, created_by_user_id, created_by_name, deleted_at, deleted_by_user_id, deleted_by_name, payload
+       FROM booking_log_archives
+      ${includeDeleted ? '' : `WHERE state = 'archived'`}
+      ORDER BY month_key DESC`,
+  );
+  return (Array.isArray(result.rows) ? result.rows : []).map((row) => {
+    const payload = parseJsonBody(row && row.payload, {});
+    const summary = bookingHistoryMonthSummaryFromPayload(payload);
+    return {
+      monthKey: String((row && row.month_key) || summary.monthKey || '').trim(),
+      monthLabel: String((row && row.month_label) || summary.monthLabel || '').trim() || bookingHistoryMonthLabel(row && row.month_key),
+      state: String((row && row.state) || 'archived').trim() || 'archived',
+      entryCount: Math.max(0, toInt((row && row.entry_count) ?? summary.entryCount, 0)),
+      doneCount: Math.max(0, toInt((row && row.done_count) ?? summary.doneCount, 0)),
+      canceledCount: Math.max(0, toInt((row && row.canceled_count) ?? summary.canceledCount, 0)),
+      createdAt: String((row && row.created_at) || '').trim(),
+      createdByUserId: String((row && row.created_by_user_id) || '').trim(),
+      createdByName: String((row && row.created_by_name) || '').trim(),
+      deletedAt: String((row && row.deleted_at) || '').trim(),
+      deletedByUserId: String((row && row.deleted_by_user_id) || '').trim(),
+      deletedByName: String((row && row.deleted_by_name) || '').trim(),
+      payload: payload && typeof payload === 'object' && !Array.isArray(payload) ? payload : {},
+    };
+  });
+}
+
 async function createApp(options = {}) {
   const app = express();
   const db = options.db || createPoolFromEnv(options.dbOptions || {});
@@ -1504,6 +1715,167 @@ async function createApp(options = {}) {
           : [];
         const locks = requests.map(bookingLockFromRow).filter(Boolean);
         res.json({ ok: true, row: { stage: 'booking_requests', payload: { meta: { source: 'backend', updatedAt: nowIso(), version: 1 }, requests }, updated_at: nowIso(), updated_by: req.auth.user.id }, locks, message: 'Cloud booking queue loaded.' });
+        return;
+      }
+      if (action === 'booking_history_get') {
+        const permissions = req.auth.payload.permissions || {};
+        if (!permissions.booking_manage) {
+          res.status(403).json({ ok: false, reason: 'forbidden', message: 'Only admin can read booking history.' });
+          return;
+        }
+        const client = await db.connect();
+        try {
+          const sourceRows = await loadBookingHistorySourceRows(client);
+          const managedRows = await loadBookingHistoryArchiveRows(client, { includeDeleted: true });
+          const hiddenMonthKeys = managedRows.map((row) => String(row.monthKey || '').trim()).filter(Boolean);
+          const archivedMonths = managedRows.filter((row) => String(row.state || '') === 'archived');
+          const availableMonths = bookingHistoryAvailableMonthSummaries(sourceRows, {
+            currentMonthKey: bookingHistoryCurrentMonthKey(),
+            excludeMonthKeys: new Set(hiddenMonthKeys),
+          });
+          res.json({
+            ok: true,
+            archived_months: archivedMonths,
+            available_months: availableMonths,
+            hidden_month_keys: hiddenMonthKeys,
+            message: 'Booking history loaded.',
+          });
+        } finally {
+          client.release();
+        }
+        return;
+      }
+      if (action === 'booking_history_archive_previous') {
+        const permissions = req.auth.payload.permissions || {};
+        if (!permissions.booking_manage) {
+          res.status(403).json({ ok: false, reason: 'forbidden', message: 'Only admin can archive booking history.' });
+          return;
+        }
+        const actorUserId = String(req.auth.user.id || '').trim();
+        const actorName = String(req.auth.user.displayName || '').trim() || 'Admin';
+        const archiveResponse = await withLockedWriteTransaction(db, async (client) => {
+          const sourceRows = await loadBookingHistorySourceRows(client);
+          const managedRows = await loadBookingHistoryArchiveRows(client, { includeDeleted: true });
+          const hiddenMonthKeys = managedRows.map((row) => String(row.monthKey || '').trim()).filter(Boolean);
+          const monthsToArchive = bookingHistoryAvailableMonthSummaries(sourceRows, {
+            currentMonthKey: bookingHistoryCurrentMonthKey(),
+            excludeMonthKeys: new Set(hiddenMonthKeys),
+          });
+          if (!monthsToArchive.length) {
+            return {
+              status: 200,
+              body: {
+                ok: true,
+                archived_count: 0,
+                archived_months: managedRows.filter((row) => String(row.state || '') === 'archived'),
+                available_months: [],
+                hidden_month_keys: hiddenMonthKeys,
+                message: 'No previous months are ready to archive.',
+              },
+            };
+          }
+          const archiveStamp = nowIso();
+          for (const month of monthsToArchive) {
+            const payload = buildBookingHistoryMonthPayload(sourceRows, month.monthKey);
+            if (!payload.entryCount) continue;
+            await client.query(
+              `INSERT INTO booking_log_archives (
+                 month_key, month_label, state, entry_count, done_count, canceled_count, created_at, created_by_user_id, created_by_name, deleted_at, deleted_by_user_id, deleted_by_name, payload
+               ) VALUES ($1,$2,'archived',$3,$4,$5,$6,$7,$8,NULL,NULL,'',$9::jsonb)
+               ON CONFLICT (month_key) DO UPDATE SET
+                 month_label = EXCLUDED.month_label,
+                 state = 'archived',
+                 entry_count = EXCLUDED.entry_count,
+                 done_count = EXCLUDED.done_count,
+                 canceled_count = EXCLUDED.canceled_count,
+                 created_at = EXCLUDED.created_at,
+                 created_by_user_id = EXCLUDED.created_by_user_id,
+                 created_by_name = EXCLUDED.created_by_name,
+                 deleted_at = NULL,
+                 deleted_by_user_id = NULL,
+                 deleted_by_name = '',
+                 payload = EXCLUDED.payload`,
+              [
+                payload.monthKey,
+                payload.monthLabel,
+                payload.entryCount,
+                payload.doneCount,
+                payload.canceledCount,
+                archiveStamp,
+                actorUserId || null,
+                actorName,
+                JSON.stringify(payload),
+              ],
+            );
+          }
+          const nextManagedRows = await loadBookingHistoryArchiveRows(client, { includeDeleted: true });
+          const nextHiddenMonthKeys = nextManagedRows.map((row) => String(row.monthKey || '').trim()).filter(Boolean);
+          return {
+            status: 200,
+            body: {
+              ok: true,
+              archived_count: monthsToArchive.length,
+              archived_months: nextManagedRows.filter((row) => String(row.state || '') === 'archived'),
+              available_months: bookingHistoryAvailableMonthSummaries(sourceRows, {
+                currentMonthKey: bookingHistoryCurrentMonthKey(),
+                excludeMonthKeys: new Set(nextHiddenMonthKeys),
+              }),
+              hidden_month_keys: nextHiddenMonthKeys,
+              message: monthsToArchive.length === 1 ? '1 history month moved out of Admin Logs.' : `${monthsToArchive.length} history months moved out of Admin Logs.`,
+            },
+          };
+        });
+        res.status((archiveResponse && archiveResponse.status) || 200).json((archiveResponse && archiveResponse.body) || { ok: false, message: 'Could not archive booking history.' });
+        return;
+      }
+      if (action === 'booking_history_delete_month') {
+        const permissions = req.auth.payload.permissions || {};
+        if (!permissions.booking_manage) {
+          res.status(403).json({ ok: false, reason: 'forbidden', message: 'Only admin can delete booking history.' });
+          return;
+        }
+        const monthKey = String(body.month_key || '').trim();
+        if (!/^\d{4}-\d{2}$/.test(monthKey)) {
+          res.status(400).json({ ok: false, reason: 'missing', message: 'Month key is required.' });
+          return;
+        }
+        const actorUserId = String(req.auth.user.id || '').trim();
+        const actorName = String(req.auth.user.displayName || '').trim() || 'Admin';
+        const deleteResponse = await withLockedWriteTransaction(db, async (client) => {
+          const existingRows = await loadBookingHistoryArchiveRows(client, { includeDeleted: true });
+          const existing = existingRows.find((row) => String(row.monthKey || '') === monthKey) || null;
+          if (!existing) {
+            return { status: 200, body: { ok: false, reason: 'missing', message: 'That history month was not found.' } };
+          }
+          if (String(existing.state || '') !== 'deleted') {
+            await client.query(
+              `UPDATE booking_log_archives
+                  SET state = 'deleted',
+                      deleted_at = $2,
+                      deleted_by_user_id = $3,
+                      deleted_by_name = $4
+                WHERE month_key = $1`,
+              [monthKey, nowIso(), actorUserId || null, actorName],
+            );
+          }
+          const nextManagedRows = await loadBookingHistoryArchiveRows(client, { includeDeleted: true });
+          const nextHiddenMonthKeys = nextManagedRows.map((row) => String(row.monthKey || '').trim()).filter(Boolean);
+          const sourceRows = await loadBookingHistorySourceRows(client);
+          return {
+            status: 200,
+            body: {
+              ok: true,
+              archived_months: nextManagedRows.filter((row) => String(row.state || '') === 'archived'),
+              available_months: bookingHistoryAvailableMonthSummaries(sourceRows, {
+                currentMonthKey: bookingHistoryCurrentMonthKey(),
+                excludeMonthKeys: new Set(nextHiddenMonthKeys),
+              }),
+              hidden_month_keys: nextHiddenMonthKeys,
+              message: `${bookingHistoryMonthLabel(monthKey)} was removed from history.`,
+            },
+          };
+        });
+        res.status((deleteResponse && deleteResponse.status) || 200).json((deleteResponse && deleteResponse.body) || { ok: false, message: 'Could not delete booking history month.' });
         return;
       }
       if (action === 'booking_save') {
