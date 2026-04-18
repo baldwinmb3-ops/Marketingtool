@@ -17,6 +17,8 @@ const { shouldSeedOnBoot } = require('./db-safety.cjs');
 const MIGRATION_SQL_PATH = path.join(__dirname, 'sql', '001_init.sql');
 const MIGRATION_SQL = fs.readFileSync(MIGRATION_SQL_PATH, 'utf8');
 const DB_QUEUE_BY_POOL = new WeakMap();
+const SESSION_CACHE_BY_POOL = new WeakMap();
+const SESSION_CACHE_TTL_MS = 10_000;
 
 function toIso(value, fallback = nowIso()) {
   const date = new Date(value || fallback);
@@ -40,6 +42,64 @@ function asJson(value, fallback) {
     }
   }
   return fallback;
+}
+
+function sessionCacheForPool(pool) {
+  let cache = SESSION_CACHE_BY_POOL.get(pool);
+  if (!cache) {
+    cache = new Map();
+    SESSION_CACHE_BY_POOL.set(pool, cache);
+  }
+  return cache;
+}
+
+function cloneSessionRecord(record) {
+  const row = record && typeof record === 'object' ? record : {};
+  const user = row.user && typeof row.user === 'object' ? row.user : null;
+  return {
+    ...row,
+    user: user
+      ? {
+          ...user,
+          departmentIds: Array.isArray(user.departmentIds) ? user.departmentIds.slice() : [],
+        }
+      : null,
+  };
+}
+
+function getCachedSessionRecord(pool, sessionId) {
+  const id = String(sessionId || '').trim();
+  if (!id) return null;
+  const cache = sessionCacheForPool(pool);
+  const entry = cache.get(id);
+  if (!entry) return null;
+  if (!entry.record || Date.now() >= Number(entry.cacheUntilMs || 0)) {
+    cache.delete(id);
+    return null;
+  }
+  const expiresAtMs = Date.parse(String(entry.record.expiresAt || ''));
+  if (!Number.isFinite(expiresAtMs) || expiresAtMs <= Date.now()) {
+    cache.delete(id);
+    return null;
+  }
+  return cloneSessionRecord(entry.record);
+}
+
+function setCachedSessionRecord(pool, sessionId, record, ttlMs = SESSION_CACHE_TTL_MS) {
+  const id = String(sessionId || '').trim();
+  if (!id || !record || typeof record !== 'object') return;
+  const cache = sessionCacheForPool(pool);
+  cache.set(id, {
+    cacheUntilMs: Date.now() + Math.max(1000, Number.parseInt(String(ttlMs || SESSION_CACHE_TTL_MS), 10) || SESSION_CACHE_TTL_MS),
+    record: cloneSessionRecord(record),
+  });
+}
+
+function clearCachedSessionRecord(pool, sessionId) {
+  const id = String(sessionId || '').trim();
+  if (!id) return;
+  const cache = sessionCacheForPool(pool);
+  cache.delete(id);
 }
 
 function normalizeDepartmentIds(value) {
@@ -1100,12 +1160,15 @@ async function createSessionRecord(pool, options = {}) {
     ) VALUES ($1,$2,$3,$4,$5,$6,$7,NULL)`,
     [id, userId, activeRole, managerOnDuty, createdAt, expiresAt, createdAt],
   );
+  clearCachedSessionRecord(pool, id);
   return { id, userId, activeRole, managerOnDuty, createdAt, expiresAt };
 }
 
 async function getSessionRecord(pool, sessionId, options = {}) {
   const id = String(sessionId || '').trim();
   if (!id) return null;
+  const cached = getCachedSessionRecord(pool, id);
+  if (cached) return cached;
   const ttlMs = Math.max(60_000, Number.parseInt(String(options.ttlMs || 0), 10) || 1000 * 60 * 60 * 12);
   const touchIntervalMs = Math.max(30_000, Number.parseInt(String(options.touchIntervalMs || 0), 10) || 60_000);
   const client = await pool.connect();
@@ -1152,7 +1215,7 @@ async function getSessionRecord(pool, sessionId, options = {}) {
       effectiveExpiresAt = toIso(nextExpiresAt);
     }
 
-    return {
+    const sessionRecord = {
       id: String(row.session_id || ''),
       userId: String(row.session_user_id || ''),
       activeRole: normalizeRole(row.session_active_role) || 'marketer',
@@ -1161,6 +1224,8 @@ async function getSessionRecord(pool, sessionId, options = {}) {
       expiresAt: effectiveExpiresAt,
       user: mapUserToState(row),
     };
+    setCachedSessionRecord(pool, id, sessionRecord);
+    return sessionRecord;
   } finally {
     client.release();
   }
@@ -1184,6 +1249,7 @@ async function updateSessionRecordRole(pool, sessionId, activeRole) {
   );
   const row = result.rows[0];
   if (!row) return null;
+  clearCachedSessionRecord(pool, id);
   return {
     id: String(row.id || ''),
     userId: String(row.user_id || ''),
@@ -1211,6 +1277,7 @@ async function updateSessionDutyStatus(pool, sessionId, managerOnDuty) {
   );
   const row = result.rows[0];
   if (!row) return null;
+  clearCachedSessionRecord(pool, id);
   return {
     id: String(row.id || ''),
     userId: String(row.user_id || ''),
@@ -1225,6 +1292,7 @@ async function revokeSessionRecord(pool, sessionId) {
   const id = String(sessionId || '').trim();
   if (!id) return;
   await pool.query('UPDATE sessions SET revoked_at = NOW() WHERE id = $1', [id]);
+  clearCachedSessionRecord(pool, id);
 }
 
 async function closePool(pool) {
