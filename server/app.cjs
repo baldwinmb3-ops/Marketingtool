@@ -588,24 +588,22 @@ async function createApp(options = {}) {
       };
     }
 
-    const identifiers = [
-      normalizeIdentifier(currentUser.email || ''),
-      normalizeIdentifier(currentUser.wwid || ''),
-      normalizeIdentifier(req && req.body && req.body.identifier),
-    ].filter(Boolean);
-
-    let targetRow = null;
-    for (const identifier of identifiers) {
-      targetRow = await findUserRowByIdentifier(db, identifier, nextRole);
-      if (targetRow) break;
-    }
-
-    let targetUser = targetRow ? mapUserToState(targetRow) : null;
+    const currentAccess = deriveAccess(currentUser);
+    let targetUser =
+      Array.isArray(currentAccess.availableRoles) && currentAccess.availableRoles.includes(nextRole) ? currentUser : null;
     if (!targetUser) {
-      const currentAccess = deriveAccess(currentUser);
-      if (Array.isArray(currentAccess.availableRoles) && currentAccess.availableRoles.includes(nextRole)) {
-        targetUser = currentUser;
+      const identifiers = [
+        normalizeIdentifier(currentUser.email || ''),
+        normalizeIdentifier(currentUser.wwid || ''),
+        normalizeIdentifier(req && req.body && req.body.identifier),
+      ].filter(Boolean);
+
+      let targetRow = null;
+      for (const identifier of identifiers) {
+        targetRow = await findUserRowByIdentifier(db, identifier, nextRole);
+        if (targetRow) break;
       }
+      targetUser = targetRow ? mapUserToState(targetRow) : null;
     }
     if (!targetUser) {
       return {
