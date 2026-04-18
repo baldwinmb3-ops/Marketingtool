@@ -1537,7 +1537,7 @@ async function createApp(options = {}) {
         res.status((saveResponse && saveResponse.status) || 200).json((saveResponse && saveResponse.body) || { ok: false, message: 'Booking save failed.' });
         return;
       }
-      if (action === 'booking_claim' || action === 'booking_complete' || action === 'booking_release') {
+      if (action === 'booking_claim' || action === 'booking_complete' || action === 'booking_release' || action === 'booking_cancel_total') {
         const permissions = req.auth.payload.permissions || {};
         if (!permissions.booking_manage) {
           res.status(403).json({ ok: false, reason: 'forbidden', message: 'Only admin can manage booking queue.' });
@@ -1664,6 +1664,58 @@ async function createApp(options = {}) {
               at: nowIso(),
             });
             return { status: 200, body: { ok: true, message: 'Request marked Done.', lock: bookingLockFromRow(found) } };
+          }
+
+          if (action === 'booking_cancel_total') {
+            if (status === 'done') {
+              return { status: 200, body: { ok: false, reason: 'already-done', message: 'Completed requests cannot be fully canceled.' } };
+            }
+            if (status === 'working' && String(found.workingByUserId || '') && String(found.workingByUserId || '') !== actorUserId) {
+              return {
+                status: 200,
+                body: {
+                  ok: false,
+                  reason: 'owner-only-cancel-total',
+                  message: `Only ${String(found.workingByName || 'the assigned admin')} can fully cancel this booking.`,
+                  lock: bookingLockFromRow(found),
+                },
+              };
+            }
+            const stamp = nowIso();
+            found.status = 'deleted';
+            found.adminName = '';
+            found.adminUserId = '';
+            found.adminDevice = '';
+            found.workingByName = '';
+            found.workingByUserId = '';
+            found.workingByDevice = '';
+            found.workingAt = '';
+            found.completedByName = '';
+            found.completedByUserId = '';
+            found.completedByDevice = '';
+            found.completedAt = '';
+            found.statusAt = stamp;
+            found.updatedAt = stamp;
+            found.revision = Math.max(1, toInt(found.revision, 1) + 1);
+            await updateBookingRowRecord(client, found);
+            await insertAuditLogRow(client, {
+              at: nowIso(),
+              action: 'booking.cancel_total',
+              actorUserId,
+              actorName,
+              targetType: 'booking',
+              targetId: found.id,
+              details: { actorDevice, source: 'cloud' },
+            });
+            await insertBookingEventRow(client, {
+              bookingId: found.id,
+              eventType: 'booking.cancel_total',
+              actorUserId,
+              actorName,
+              details: { actorDevice, source: 'cloud' },
+              at: nowIso(),
+            });
+            return { status: 200, body: { ok: true, message: 'Booking canceled and removed from queue.' } };
           }
 
           if (status === 'done') {
