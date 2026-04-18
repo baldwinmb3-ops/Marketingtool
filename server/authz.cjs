@@ -39,7 +39,7 @@ function deriveAccess(user) {
   const availableRoles = [];
   if (canAdmin) availableRoles.push('admin');
   if (canMarketer) availableRoles.push('marketer');
-  if (!availableRoles.length && canManager) availableRoles.push('manager');
+  if (canManager) availableRoles.push('manager');
 
   return {
     availableRoles,
