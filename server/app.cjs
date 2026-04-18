@@ -1433,8 +1433,9 @@ async function createApp(options = {}) {
         const result = await switchSessionRoleCore(req, requestedRole);
         if (result.sessionId) setSessionCookie(res, result.sessionId);
         if (result.status === 200 && result.user) {
-          await withDb(db, async (state) => {
-            logAudit(state, {
+          await withLockedWriteTransaction(db, async (client) => {
+            await insertAuditLogRow(client, {
+              at: nowIso(),
               action: 'auth.switch_role',
               actorUserId: result.user.id,
               actorName: result.user.displayName,
