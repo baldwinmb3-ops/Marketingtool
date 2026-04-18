@@ -1107,40 +1107,63 @@ async function getSessionRecord(pool, sessionId, options = {}) {
   const id = String(sessionId || '').trim();
   if (!id) return null;
   const ttlMs = Math.max(60_000, Number.parseInt(String(options.ttlMs || 0), 10) || 1000 * 60 * 60 * 12);
-  const rows = await pool.query(
-    `SELECT
-      s.id AS session_id,
-      s.user_id AS session_user_id,
-      s.active_role AS session_active_role,
-      s.manager_on_duty AS session_manager_on_duty,
-      s.created_at AS session_created_at,
-      s.expires_at AS session_expires_at,
-      u.*
-    FROM sessions s
-    JOIN users u ON u.id = s.user_id
-    WHERE s.id = $1
-      AND s.revoked_at IS NULL
-      AND s.expires_at > NOW()
-      AND u.status = 'active'
-    LIMIT 1`,
-    [id],
-  );
-  const row = rows.rows[0];
-  if (!row) return null;
+  const touchIntervalMs = Math.max(30_000, Number.parseInt(String(options.touchIntervalMs || 0), 10) || 60_000);
+  const client = await pool.connect();
+  try {
+    const rows = await client.query(
+      `SELECT
+        s.id AS session_id,
+        s.user_id AS session_user_id,
+        s.active_role AS session_active_role,
+        s.manager_on_duty AS session_manager_on_duty,
+        s.created_at AS session_created_at,
+        s.expires_at AS session_expires_at,
+        s.last_seen_at AS session_last_seen_at,
+        u.*
+      FROM sessions s
+      JOIN users u ON u.id = s.user_id
+      WHERE s.id = $1
+        AND s.revoked_at IS NULL
+        AND s.expires_at > NOW()
+        AND u.status = 'active'
+      LIMIT 1`,
+      [id],
+    );
+    const row = rows.rows[0];
+    if (!row) return null;
 
-  const nextExpiresAt = new Date(Date.now() + ttlMs).toISOString();
-  const lastSeenAt = nowIso();
-  await pool.query('UPDATE sessions SET expires_at = $2, last_seen_at = $3 WHERE id = $1', [id, nextExpiresAt, lastSeenAt]);
+    const nowMs = Date.now();
+    const existingExpiresAt = toIso(row.session_expires_at);
+    const existingLastSeenAt = toIso(row.session_last_seen_at || row.session_created_at);
+    const expiresAtMs = new Date(existingExpiresAt).getTime();
+    const lastSeenAtMs = new Date(existingLastSeenAt).getTime();
+    let effectiveExpiresAt = existingExpiresAt;
 
-  return {
-    id: String(row.session_id || ''),
-    userId: String(row.session_user_id || ''),
-    activeRole: normalizeRole(row.session_active_role) || 'marketer',
-    managerOnDuty: toBool(row.session_manager_on_duty, false),
-    createdAt: toIso(row.session_created_at),
-    expiresAt: toIso(nextExpiresAt),
-    user: mapUserToState(row),
-  };
+    const shouldTouchSession =
+      !Number.isFinite(expiresAtMs) ||
+      !Number.isFinite(lastSeenAtMs) ||
+      nowMs - lastSeenAtMs >= touchIntervalMs ||
+      expiresAtMs - nowMs <= touchIntervalMs;
+
+    if (shouldTouchSession) {
+      const nextExpiresAt = new Date(nowMs + ttlMs).toISOString();
+      const lastSeenAt = new Date(nowMs).toISOString();
+      await client.query('UPDATE sessions SET expires_at = $2, last_seen_at = $3 WHERE id = $1', [id, nextExpiresAt, lastSeenAt]);
+      effectiveExpiresAt = toIso(nextExpiresAt);
+    }
+
+    return {
+      id: String(row.session_id || ''),
+      userId: String(row.session_user_id || ''),
+      activeRole: normalizeRole(row.session_active_role) || 'marketer',
+      managerOnDuty: toBool(row.session_manager_on_duty, false),
+      createdAt: toIso(row.session_created_at),
+      expiresAt: effectiveExpiresAt,
+      user: mapUserToState(row),
+    };
+  } finally {
+    client.release();
+  }
 }
 
 async function updateSessionRecordRole(pool, sessionId, activeRole) {
