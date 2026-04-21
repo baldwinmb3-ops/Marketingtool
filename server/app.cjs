@@ -35,6 +35,7 @@ const {
   updateSessionDutyStatus,
   revokeSessionRecord,
   updateUserPassword,
+  upsertUserRow,
 } = require('./db.cjs');
 const { deriveAccess, buildSessionPayload } = require('./authz.cjs');
 const { latestValidatedBackup } = require('./backup-safety.cjs');
@@ -242,9 +243,40 @@ function saveAndSendStatusHttpStatus(status) {
 }
 
 async function readSaveAndSendStatus(pool, requestId) {
-  const state = await readDb(pool);
-  const entries = Array.isArray(state && state.audit) ? state.audit : [];
-  return saveAndSendStatusFromAuditEntries(entries, requestId);
+  const normalizedRequestId = normalizeCloudRequestId(requestId);
+  if (!normalizedRequestId) {
+    return saveAndSendStatusFromAuditEntries([], normalizedRequestId);
+  }
+  const result = await pool.query(
+    `SELECT id, at, action, actor_user_id, actor_name, target_type, target_id, details
+       FROM audit_log
+      WHERE action = ANY($2::text[])
+        AND (
+          target_id = $1
+          OR details->>'requestId' = $1
+          OR details->>'request_id' = $1
+        )
+      ORDER BY at ASC`,
+    [
+      normalizedRequestId,
+      [
+        SAVE_AND_SEND_AUDIT_ACTION_STARTED,
+        SAVE_AND_SEND_AUDIT_ACTION_SUCCESS,
+        SAVE_AND_SEND_AUDIT_ACTION_FAILED,
+      ],
+    ],
+  );
+  const entries = result.rows.map((row) => ({
+    id: String(row.id || '').trim(),
+    at: String(row.at || '').trim(),
+    action: String(row.action || '').trim(),
+    actorUserId: String(row.actor_user_id || '').trim(),
+    actorName: String(row.actor_name || '').trim(),
+    targetType: String(row.target_type || '').trim(),
+    targetId: String(row.target_id || '').trim(),
+    details: row && row.details && typeof row.details === 'object' && !Array.isArray(row.details) ? row.details : {},
+  }));
+  return saveAndSendStatusFromAuditEntries(entries, normalizedRequestId);
 }
 
 async function insertAuditLogRow(client, entry) {
@@ -264,6 +296,182 @@ async function insertAuditLogRow(client, entry) {
       JSON.stringify(row.details && typeof row.details === 'object' ? row.details : {}),
     ],
   );
+}
+
+async function appendAuditLogEntry(pool, entry) {
+  await withLockedWriteTransaction(pool, async (client) => {
+    await insertAuditLogRow(client, entry);
+  });
+}
+
+async function createSaveAndSendStartedMarker(pool, options = {}) {
+  const requestId = normalizeCloudRequestId(options.requestId);
+  const actorUserId = String(options.actorUserId || '').trim();
+  const actorName = String(options.actorName || '').trim();
+  return withLockedWriteTransaction(pool, async (client) => {
+    const currentPublished = await client.query(
+      'SELECT version FROM snapshot_published_current WHERE id = TRUE LIMIT 1 FOR UPDATE',
+    );
+    const currentVersion = Math.max(
+      0,
+      toInt(currentPublished.rows[0] && currentPublished.rows[0].version, 0),
+    );
+    const expectedVersion = Math.max(1, currentVersion + 1);
+    const startedAt = nowIso();
+    const expectedStamp = `${startedAt}|${expectedVersion}`;
+    await insertAuditLogRow(client, {
+      action: SAVE_AND_SEND_AUDIT_ACTION_STARTED,
+      actorUserId,
+      actorName,
+      targetType: 'snapshot',
+      targetId: requestId,
+      details: {
+        requestId,
+        expectedVersion,
+        expectedStamp,
+      },
+    });
+    return { startedAt, expectedVersion, expectedStamp };
+  });
+}
+
+async function applyUserOperationsWithDirectPersistence(client, userOps, actor) {
+  const operations = Array.isArray(userOps) ? userOps : [];
+  if (!operations.length) {
+    return {
+      received: 0,
+      queued: 0,
+      readyCount: 0,
+    };
+  }
+  const usersResult = await client.query('SELECT * FROM users ORDER BY created_at ASC');
+  const state = {
+    users: usersResult.rows.map(mapUserToState),
+    audit: [],
+  };
+  operations.forEach((op) => applyUserOperation(state, op, actor, logAudit));
+  for (const user of state.users) {
+    await upsertUserRow(client, user);
+  }
+  for (const entry of state.audit) {
+    await insertAuditLogRow(client, entry);
+  }
+  return {
+    received: operations.length,
+    queued: operations.length,
+    readyCount: operations.filter((op) => op && op.op === 'create_user').length,
+  };
+}
+
+async function runQueuedSaveAndSendUserOperations(pool, options = {}) {
+  const userOps = Array.isArray(options.userOps) ? options.userOps : [];
+  if (!userOps.length) return;
+  const actor = options.actor && typeof options.actor === 'object' ? options.actor : {};
+  const requestId = normalizeCloudRequestId(options.requestId);
+  await withLockedWriteTransaction(pool, async (client) => {
+    const applied = await applyUserOperationsWithDirectPersistence(client, userOps, actor);
+    await insertAuditLogRow(client, {
+      action: 'user.apply_operations',
+      actorUserId: String(actor.userId || '').trim(),
+      actorName: String(actor.name || '').trim(),
+      targetType: 'user',
+      targetId: userOps.map((op) => String(op && op.wwid ? op.wwid : '').trim()).filter(Boolean).join(','),
+      details: {
+        operations: applied.received,
+        requestId,
+        source: 'save_and_send',
+      },
+    });
+  });
+}
+
+async function publishSaveAndSendSnapshot(pool, options = {}) {
+  const actor = options.actor && typeof options.actor === 'object' ? options.actor : {};
+  const requestId = normalizeCloudRequestId(options.requestId);
+  const startedAt = String(options.startedAt || '').trim();
+  const userOps = Array.isArray(options.userOps) ? options.userOps : [];
+  const payload = sanitizeCatalogPayload(options.payload);
+  return withLockedWriteTransaction(pool, async (client) => {
+    const currentPublished = await client.query(
+      'SELECT version FROM snapshot_published_current WHERE id = TRUE LIMIT 1 FOR UPDATE',
+    );
+    const currentVersion = Math.max(
+      0,
+      toInt(currentPublished.rows[0] && currentPublished.rows[0].version, 0),
+    );
+    const nextVersion = Math.max(1, currentVersion + 1);
+    const stamp = nowIso();
+    payload.meta = payload.meta && typeof payload.meta === 'object' ? payload.meta : {};
+    payload.meta.version = nextVersion;
+    payload.meta.publishedAt = stamp;
+    payload.meta.updatedAt = stamp;
+
+    await client.query(
+      `INSERT INTO snapshot_published_current (
+         id, version, published_at, updated_at, published_by_user_id, payload
+       ) VALUES (
+         TRUE, $1, $2, $3, $4, $5::jsonb
+       )
+       ON CONFLICT (id) DO UPDATE SET
+         version = EXCLUDED.version,
+         published_at = EXCLUDED.published_at,
+         updated_at = EXCLUDED.updated_at,
+         published_by_user_id = EXCLUDED.published_by_user_id,
+         payload = EXCLUDED.payload`,
+      [
+        nextVersion,
+        stamp,
+        stamp,
+        String(actor.userId || '').trim(),
+        JSON.stringify(payload),
+      ],
+    );
+
+    await client.query(
+      `INSERT INTO snapshot_history (
+         version, published_at, updated_at, published_by_user_id, payload
+       ) VALUES (
+         $1, $2, $3, $4, $5::jsonb
+       )
+       ON CONFLICT (version) DO UPDATE SET
+         published_at = EXCLUDED.published_at,
+         updated_at = EXCLUDED.updated_at,
+         published_by_user_id = EXCLUDED.published_by_user_id,
+         payload = EXCLUDED.payload`,
+      [
+        nextVersion,
+        stamp,
+        stamp,
+        String(actor.userId || '').trim(),
+        JSON.stringify(payload),
+      ],
+    );
+
+    await client.query(
+      `INSERT INTO snapshot_draft (
+         id, updated_at, updated_by_user_id, payload
+       ) VALUES (
+         TRUE, $1, $2, $3::jsonb
+       )
+       ON CONFLICT (id) DO UPDATE SET
+         updated_at = EXCLUDED.updated_at,
+         updated_by_user_id = EXCLUDED.updated_by_user_id,
+         payload = EXCLUDED.payload`,
+      [
+        stamp,
+        String(actor.userId || '').trim(),
+        JSON.stringify(payload),
+      ],
+    );
+
+    return {
+      requestId,
+      startedAt,
+      version: nextVersion,
+      publishedAt: stamp,
+      userOperations: userOps.length,
+    };
+  });
 }
 
 async function insertBookingEventRow(client, entry) {
@@ -525,6 +733,10 @@ async function createApp(options = {}) {
   const app = express();
   const db = options.db || createPoolFromEnv(options.dbOptions || {});
   const ownsDbPool = !options.db;
+  const testHooks =
+    options.testHooks && typeof options.testHooks === 'object' && !Array.isArray(options.testHooks)
+      ? options.testHooks
+      : {};
   const runtimeInfo =
     options.runtimeInfo && typeof options.runtimeInfo === 'object' && !Array.isArray(options.runtimeInfo)
       ? options.runtimeInfo
@@ -2261,106 +2473,96 @@ async function createApp(options = {}) {
           res.status(saveAndSendStatusHttpStatus(publishStatus.status)).json(publishStatus);
           return;
         }
-        const preflightState = await readDb(db);
-        const currentPublished = preflightState && preflightState.snapshots && preflightState.snapshots.published
-          ? preflightState.snapshots.published
-          : null;
-        const expectedVersion = Math.max(1, toInt(currentPublished && currentPublished.version, 0) + 1);
-        const startedAt = nowIso();
-        await withDb(db, async (state) => {
-          logAudit(state, {
-            action: SAVE_AND_SEND_AUDIT_ACTION_STARTED,
-            actorUserId: req.auth.user.id,
-            actorName: req.auth.user.displayName,
-            targetType: 'snapshot',
-            targetId: requestId,
-            details: {
-              requestId,
-              expectedVersion,
-              expectedStamp: `${startedAt}|${expectedVersion}`,
-            },
-          });
+        const actor = { userId: req.auth.user.id, name: req.auth.user.displayName };
+        const payload = sanitizeCatalogPayload(body.payload);
+        const userOps = normalizeUserOperations(body.user_operations);
+        const startedMarker = await createSaveAndSendStartedMarker(db, {
+          requestId,
+          actorUserId: actor.userId,
+          actorName: actor.name,
         });
+        const startedAt = startedMarker.startedAt;
+        if (typeof testHooks.onSaveAndSendStarted === 'function') {
+          await testHooks.onSaveAndSendStarted({
+            requestId,
+            startedAt,
+            expectedVersion: startedMarker.expectedVersion,
+            expectedStamp: startedMarker.expectedStamp,
+          });
+        }
         let result = null;
         try {
-          result = await withDb(db, async (db) => {
-          const payload = sanitizeCatalogPayload(body.payload);
-          const userOps = normalizeUserOperations(body.user_operations);
-          const currentPublished = db.snapshots && db.snapshots.published ? db.snapshots.published : null;
-          const nextVersion = Math.max(1, toInt(currentPublished && currentPublished.version, 0) + 1);
-          const stamp = nowIso();
-          payload.meta = payload.meta && typeof payload.meta === 'object' ? payload.meta : {};
-          payload.meta.version = nextVersion;
-          payload.meta.publishedAt = stamp;
-          payload.meta.updatedAt = stamp;
-          db.snapshots.published = { version: nextVersion, publishedAt: stamp, updatedAt: stamp, publishedByUserId: req.auth.user.id, payload };
-          if (!Array.isArray(db.snapshots.history)) db.snapshots.history = [];
-          db.snapshots.history.push(db.snapshots.published);
-          db.snapshots.draft = { updatedAt: stamp, updatedByUserId: req.auth.user.id, payload };
-          const actor = { userId: req.auth.user.id, name: req.auth.user.displayName };
-          userOps.forEach((op) => applyUserOperation(db, op, actor, logAudit));
-          logAudit(db, {
+          const publishResult = await publishSaveAndSendSnapshot(db, {
+            payload,
+            userOps,
+            actor,
+            requestId,
+            startedAt,
+          });
+          if (userOps.length) {
+            await runQueuedSaveAndSendUserOperations(db, {
+              userOps,
+              actor,
+              requestId,
+            });
+          }
+          await appendAuditLogEntry(db, {
             action: SAVE_AND_SEND_AUDIT_ACTION_SUCCESS,
-            actorUserId: req.auth.user.id,
-            actorName: req.auth.user.displayName,
+            actorUserId: actor.userId,
+            actorName: actor.name,
             targetType: 'snapshot',
-            targetId: String(nextVersion),
+            targetId: String(publishResult.version),
             details: {
               requestId,
               startedAt,
-              version: nextVersion,
-              publishedAt: stamp,
+              version: publishResult.version,
+              publishedAt: publishResult.publishedAt,
               userOperations: userOps.length,
               message: 'Cloud synced.',
             },
           });
-          return {
+          result = {
             status: 200,
             body: {
               ok: true,
               status: 'confirmed_success',
               request_id: requestId,
               message: 'Cloud synced.',
-              version: nextVersion,
-              published_at: stamp,
-              account_readiness: { pending: 0, ready: userOps.filter((op) => op.op === 'create_user').length, failed: 0 },
+              version: publishResult.version,
+              published_at: publishResult.publishedAt,
+              account_readiness: { pending: 0, ready: userOps.filter((op) => op && op.op === 'create_user').length, failed: 0 },
               user_operations: { received: userOps.length, queued: userOps.length },
             },
           };
-        });
         } catch (error) {
-          await withDb(db, async (state) => {
-            logAudit(state, {
-              action: SAVE_AND_SEND_AUDIT_ACTION_FAILED,
-              actorUserId: req.auth && req.auth.user ? req.auth.user.id : '',
-              actorName: req.auth && req.auth.user ? req.auth.user.displayName : '',
-              targetType: 'snapshot',
-              targetId: requestId,
-              details: {
-                requestId,
-                startedAt,
-                code: String((error && error.code) || '').trim(),
-                message: String((error && error.message) || 'Cloud save failed.').trim() || 'Cloud save failed.',
-              },
-            });
+          await appendAuditLogEntry(db, {
+            action: SAVE_AND_SEND_AUDIT_ACTION_FAILED,
+            actorUserId: req.auth && req.auth.user ? req.auth.user.id : '',
+            actorName: req.auth && req.auth.user ? req.auth.user.displayName : '',
+            targetType: 'snapshot',
+            targetId: requestId,
+            details: {
+              requestId,
+              startedAt,
+              code: String((error && error.code) || '').trim(),
+              message: String((error && error.message) || 'Cloud save failed.').trim() || 'Cloud save failed.',
+            },
           });
           throw error;
         }
         if (!(result && result.status >= 200 && result.status < 300 && result.body && result.body.ok)) {
-          await withDb(db, async (state) => {
-            logAudit(state, {
-              action: SAVE_AND_SEND_AUDIT_ACTION_FAILED,
-              actorUserId: req.auth && req.auth.user ? req.auth.user.id : '',
-              actorName: req.auth && req.auth.user ? req.auth.user.displayName : '',
-              targetType: 'snapshot',
-              targetId: requestId,
-              details: {
-                requestId,
-                startedAt,
-                code: String((result && result.body && result.body.code) || '').trim(),
-                message: String((result && result.body && result.body.message) || 'Cloud save failed.').trim() || 'Cloud save failed.',
-              },
-            });
+          await appendAuditLogEntry(db, {
+            action: SAVE_AND_SEND_AUDIT_ACTION_FAILED,
+            actorUserId: req.auth && req.auth.user ? req.auth.user.id : '',
+            actorName: req.auth && req.auth.user ? req.auth.user.displayName : '',
+            targetType: 'snapshot',
+            targetId: requestId,
+            details: {
+              requestId,
+              startedAt,
+              code: String((result && result.body && result.body.code) || '').trim(),
+              message: String((result && result.body && result.body.message) || 'Cloud save failed.').trim() || 'Cloud save failed.',
+            },
           });
         }
         res.status(result.status || 200).json(result.body || { ok: false, message: 'Cloud sync failed.' });

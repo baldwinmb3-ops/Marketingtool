@@ -14,6 +14,16 @@ async function listen(serverApp) {
   });
 }
 
+function createDeferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+
 async function readJson(res) {
   const text = await res.text();
   try {
@@ -23,14 +33,20 @@ async function readJson(res) {
   }
 }
 
-async function setupHarness() {
+async function setupHarness(appOptions = {}) {
   const mem = newDb({ autoCreateForeignKeyIndices: true, noAstCoverageCheck: true });
   const pgAdapter = mem.adapters.createPg();
   const db = new pgAdapter.Pool();
+  const finalOptions = appOptions && typeof appOptions === 'object' ? appOptions : {};
+  const runtimeInfo =
+    finalOptions.runtimeInfo && typeof finalOptions.runtimeInfo === 'object' && !Array.isArray(finalOptions.runtimeInfo)
+      ? finalOptions.runtimeInfo
+      : {};
   const { app } = await createApp({
     db,
     seedDatabase: false,
-    runtimeInfo: { mode: 'test', persistence: 'pg-mem', degraded: false },
+    ...finalOptions,
+    runtimeInfo: { mode: 'test', persistence: 'pg-mem', degraded: false, ...runtimeInfo },
   });
   const stamp = '2026-04-20T12:00:00.000Z';
   const snapshotPayload = {
@@ -230,6 +246,80 @@ test('cloud save_and_sync_status returns pending_confirmation for started but un
   }
 });
 
+test('cloud save_and_sync_status reads audit_log directly without full-state reads', async () => {
+  const harness = await setupHarness();
+  const requestId = 'pending-save-status-direct-read';
+  const originalQuery = harness.db.query.bind(harness.db);
+  const originalConnect = harness.db.connect.bind(harness.db);
+  const blockFullStateRead = (text) => {
+    const sql = String(text || '').replace(/\s+/g, ' ').trim().toLowerCase();
+    return (
+      sql === 'select * from users order by created_at asc' ||
+      sql === 'select * from snapshot_published_current where id = true limit 1' ||
+      sql === 'select * from snapshot_history order by version asc' ||
+      sql === 'select * from snapshot_draft where id = true limit 1' ||
+      sql === 'select row_data from bookings order by created_at asc' ||
+      sql === 'select * from booking_events order by created_at asc'
+    );
+  };
+  try {
+    await signIn(harness);
+    await harness.db.query(
+      `INSERT INTO audit_log (id, at, action, actor_user_id, actor_name, target_type, target_id, details)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb)`,
+      [
+        'audit-pending-save-status-direct-read-started',
+        '2026-04-20T16:30:00.000Z',
+        'catalog.save_and_send_started',
+        'user-admin-1',
+        'Primary Admin',
+        'snapshot',
+        requestId,
+        JSON.stringify({
+          requestId,
+          expectedVersion: 8,
+          expectedStamp: '2026-04-20T16:30:00.000Z|8',
+        }),
+      ],
+    );
+
+    harness.db.query = async (text, params) => {
+      if (blockFullStateRead(text)) {
+        throw new Error(`save_and_sync_status should not use full-state read: ${String(text || '').trim()}`);
+      }
+      return originalQuery(text, params);
+    };
+    harness.db.connect = async (...args) => {
+      const client = await originalConnect(...args);
+      const originalClientQuery = client.query.bind(client);
+      client.query = async (text, params) => {
+        if (blockFullStateRead(text)) {
+          throw new Error(`save_and_sync_status should not use full-state read: ${String(text || '').trim()}`);
+        }
+        return originalClientQuery(text, params);
+      };
+      return client;
+    };
+
+    const pending = await requestJson(harness, '/api/cloud', {
+      method: 'POST',
+      body: {
+        action: 'save_and_sync_status',
+        request_id: requestId,
+      },
+    });
+
+    assert.equal(pending.status, 202, `pending status should still return 202 without full-state reads: ${JSON.stringify(pending.body)}`);
+    assert.equal(pending.body.ok, false);
+    assert.equal(pending.body.status, 'pending_confirmation');
+    assert.equal(pending.body.request_id, requestId);
+  } finally {
+    harness.db.query = originalQuery;
+    harness.db.connect = originalConnect;
+    await teardownHarness(harness);
+  }
+});
+
 test('cloud save_and_sync_status returns confirmed_failure for failed requests', async () => {
   const harness = await setupHarness();
   try {
@@ -290,6 +380,71 @@ test('cloud save_and_sync_status returns confirmed_failure for failed requests',
     assert.equal(failed.body.code, 'INJECTED_FAILURE');
     assert.equal(failed.body.message, 'Injected save failure.');
   } finally {
+    await teardownHarness(harness);
+  }
+});
+
+test('cloud save_and_sync makes a fresh request_id visible before the delayed publish completes and still returns success on the primary request', async () => {
+  const requestId = 'delayed-primary-save-status';
+  const started = createDeferred();
+  const release = createDeferred();
+  const harness = await setupHarness({
+    testHooks: {
+      onSaveAndSendStarted: ({ requestId: hookRequestId }) => {
+        if (hookRequestId !== requestId) return undefined;
+        started.resolve();
+        return release.promise;
+      },
+    },
+  });
+  try {
+    await signIn(harness);
+    const published = await requestJson(harness, '/api/snapshots/published/latest');
+    assert.equal(published.status, 200, `published snapshot fetch failed: ${JSON.stringify(published.body)}`);
+
+    const saveSendPromise = requestJson(harness, '/api/cloud', {
+      method: 'POST',
+      body: {
+        action: 'save_and_sync',
+        payload: published.body.snapshot,
+        request_id: requestId,
+      },
+    });
+
+    await started.promise;
+
+    const pending = await requestJson(harness, '/api/cloud', {
+      method: 'POST',
+      body: {
+        action: 'save_and_sync_status',
+        request_id: requestId,
+      },
+    });
+    assert.equal(pending.status, 202, `fresh request id should be visible while save is in flight: ${JSON.stringify(pending.body)}`);
+    assert.equal(pending.body.status, 'pending_confirmation');
+    assert.equal(pending.body.request_id, requestId);
+
+    release.resolve();
+
+    const saveSend = await saveSendPromise;
+    assert.equal(saveSend.status, 200, `delayed save_and_sync should still complete on the primary request: ${JSON.stringify(saveSend.body)}`);
+    assert.equal(saveSend.body.ok, true);
+    assert.equal(saveSend.body.status, 'confirmed_success');
+    assert.equal(saveSend.body.request_id, requestId);
+
+    const confirmed = await requestJson(harness, '/api/cloud', {
+      method: 'POST',
+      body: {
+        action: 'save_and_sync_status',
+        request_id: requestId,
+      },
+    });
+    assert.equal(confirmed.status, 200, `fresh request id should confirm after the save completes: ${JSON.stringify(confirmed.body)}`);
+    assert.equal(confirmed.body.ok, true);
+    assert.equal(confirmed.body.status, 'confirmed_success');
+    assert.equal(confirmed.body.request_id, requestId);
+  } finally {
+    release.resolve();
     await teardownHarness(harness);
   }
 });
