@@ -1378,3 +1378,200 @@ test('cloud save_and_sync rejects malformed user operations before publishing a 
     await closePool(h.db);
   }
 });
+
+test('cloud save_and_sync_status returns unknown for an unrecorded request id', async () => {
+  const h = await setupHarness();
+  try {
+    await signIn(h.agent, 'ADMIN1001', 'Admin123A', 'admin');
+
+    const statusInfo = await h.agent.post('/api/cloud').send({
+      action: 'save_and_sync_status',
+      request_id: 'missing-save-status',
+    });
+
+    assert.equal(statusInfo.status, 404, `Missing save status should return 404: ${JSON.stringify(statusInfo.body)}`);
+    assert.equal(statusInfo.body.ok, false);
+    assert.equal(statusInfo.body.status, 'unknown');
+    assert.equal(statusInfo.body.request_id, 'missing-save-status');
+  } finally {
+    await closePool(h.db);
+  }
+});
+
+test('cloud save_and_sync_status returns pending_confirmation for started but unconfirmed requests', async () => {
+  const h = await setupHarness();
+  try {
+    await signIn(h.agent, 'ADMIN1001', 'Admin123A', 'admin');
+    const requestId = 'pending-save-status';
+
+    await h.db.query(
+      `INSERT INTO audit_log (id, at, action, actor_user_id, actor_name, target_type, target_id, details)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb)`,
+      [
+        'audit-pending-save-status-started',
+        '2026-04-20T16:00:00.000Z',
+        'catalog.save_and_send_started',
+        'user-admin-1',
+        'Primary Admin',
+        'snapshot',
+        requestId,
+        JSON.stringify({
+          requestId,
+          expectedVersion: 7,
+          expectedStamp: '2026-04-20T16:00:00.000Z|7',
+        }),
+      ],
+    );
+
+    const pending = await h.agent.post('/api/cloud').send({
+      action: 'save_and_sync_status',
+      request_id: requestId,
+    });
+
+    assert.equal(pending.status, 202, `Pending save status should return 202: ${JSON.stringify(pending.body)}`);
+    assert.equal(pending.body.ok, false);
+    assert.equal(pending.body.status, 'pending_confirmation');
+    assert.equal(pending.body.request_id, requestId);
+    assert.equal(pending.body.expected_version, 7);
+    assert.equal(pending.body.expected_stamp, '2026-04-20T16:00:00.000Z|7');
+  } finally {
+    await closePool(h.db);
+  }
+});
+
+test('cloud save_and_sync_status returns confirmed_failure for failed requests', async () => {
+  const h = await setupHarness();
+  try {
+    await signIn(h.agent, 'ADMIN1001', 'Admin123A', 'admin');
+    const requestId = 'failed-save-status';
+
+    await h.db.query(
+      `INSERT INTO audit_log (id, at, action, actor_user_id, actor_name, target_type, target_id, details)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb)`,
+      [
+        'audit-failed-save-status-started',
+        '2026-04-20T16:00:00.000Z',
+        'catalog.save_and_send_started',
+        'user-admin-1',
+        'Primary Admin',
+        'snapshot',
+        requestId,
+        JSON.stringify({
+          requestId,
+          expectedVersion: 7,
+          expectedStamp: '2026-04-20T16:00:00.000Z|7',
+        }),
+      ],
+    );
+
+    await h.db.query(
+      `INSERT INTO audit_log (id, at, action, actor_user_id, actor_name, target_type, target_id, details)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb)`,
+      [
+        'audit-failed-save-status-failed',
+        '2026-04-20T16:00:05.000Z',
+        'catalog.save_and_send_failed',
+        'user-admin-1',
+        'Primary Admin',
+        'snapshot',
+        requestId,
+        JSON.stringify({
+          requestId,
+          startedAt: '2026-04-20T16:00:00.000Z',
+          code: 'INJECTED_FAILURE',
+          message: 'Injected save failure.',
+        }),
+      ],
+    );
+
+    const failed = await h.agent.post('/api/cloud').send({
+      action: 'save_and_sync_status',
+      request_id: requestId,
+    });
+
+    assert.equal(failed.status, 200, `Confirmed failure status should return 200: ${JSON.stringify(failed.body)}`);
+    assert.equal(failed.body.ok, false);
+    assert.equal(failed.body.status, 'confirmed_failure');
+    assert.equal(failed.body.request_id, requestId);
+    assert.equal(failed.body.code, 'INJECTED_FAILURE');
+    assert.equal(failed.body.message, 'Injected save failure.');
+  } finally {
+    await closePool(h.db);
+  }
+});
+
+test('cloud save_and_sync_status returns confirmed_success for completed save_and_sync requests and replays by request id', async () => {
+  const h = await setupHarness();
+  try {
+    await signIn(h.agent, 'ADMIN1001', 'Admin123A', 'admin');
+    const published = await h.agent.get('/api/snapshots/published/latest');
+    assert.equal(published.status, 200, `Published snapshot fetch failed: ${JSON.stringify(published.body)}`);
+    const beforeVersion = Number(published.body.metadata && published.body.metadata.version);
+    const requestId = 'successful-save-status';
+
+    const saveSend = await h.agent.post('/api/cloud').send({
+      action: 'save_and_sync',
+      payload: published.body.snapshot,
+      request_id: requestId,
+    });
+
+    assert.equal(saveSend.status, 200, `save_and_sync should succeed: ${JSON.stringify(saveSend.body)}`);
+    assert.equal(saveSend.body.ok, true);
+    assert.equal(saveSend.body.status, 'confirmed_success');
+    assert.equal(saveSend.body.request_id, requestId);
+
+    const statusInfo = await h.agent.post('/api/cloud').send({
+      action: 'save_and_sync_status',
+      request_id: requestId,
+    });
+
+    assert.equal(statusInfo.status, 200, `save_and_sync_status should confirm success: ${JSON.stringify(statusInfo.body)}`);
+    assert.equal(statusInfo.body.ok, true);
+    assert.equal(statusInfo.body.status, 'confirmed_success');
+    assert.equal(statusInfo.body.request_id, requestId);
+    assert.equal(Number(statusInfo.body.version || 0), beforeVersion + 1);
+
+    const replay = await h.agent.post('/api/cloud').send({
+      action: 'save_and_sync',
+      payload: published.body.snapshot,
+      request_id: requestId,
+    });
+
+    assert.equal(replay.status, 200, `Repeated request id should replay prior success: ${JSON.stringify(replay.body)}`);
+    assert.equal(replay.body.ok, true);
+    assert.equal(replay.body.status, 'confirmed_success');
+    assert.equal(replay.body.request_id, requestId);
+
+    const afterPublished = await h.agent.get('/api/snapshots/published/latest');
+    assert.equal(afterPublished.status, 200, `Published snapshot fetch after save failed: ${JSON.stringify(afterPublished.body)}`);
+    assert.equal(Number(afterPublished.body.metadata && afterPublished.body.metadata.version), beforeVersion + 1);
+  } finally {
+    await closePool(h.db);
+  }
+});
+
+test('cloud health_check and auth_lookup still behave unchanged with save_and_sync_status support', async () => {
+  const h = await setupHarness();
+  try {
+    await signIn(h.agent, 'ADMIN1001', 'Admin123A', 'admin');
+
+    const health = await h.agent.post('/api/cloud').send({
+      action: 'health_check',
+    });
+    assert.equal(health.status, 200, `health_check should still succeed: ${JSON.stringify(health.body)}`);
+    assert.equal(health.body.ok, true);
+    assert.equal(health.body.configured, true);
+
+    const lookup = await h.agent.post('/api/cloud').send({
+      action: 'auth_lookup',
+      identifier: 'ADMIN1001',
+      role: 'admin',
+    });
+    assert.equal(lookup.status, 200, `auth_lookup should still succeed: ${JSON.stringify(lookup.body)}`);
+    assert.equal(lookup.body.ok, true);
+    assert.equal(lookup.body.found, true);
+    assert.equal(lookup.body.account_state, 'available');
+  } finally {
+    await closePool(h.db);
+  }
+});
