@@ -148,6 +148,105 @@ function bookingRowFromDbRecord(dbRow) {
   return booking;
 }
 
+const SAVE_AND_SEND_AUDIT_ACTION_STARTED = 'catalog.save_and_send_started';
+const SAVE_AND_SEND_AUDIT_ACTION_SUCCESS = 'catalog.save_and_send';
+const SAVE_AND_SEND_AUDIT_ACTION_FAILED = 'catalog.save_and_send_failed';
+
+function normalizeCloudRequestId(value) {
+  return String(value || '')
+    .trim()
+    .toLowerCase()
+    .slice(0, 160);
+}
+
+function auditEntryDetails(entry) {
+  return entry && entry.details && typeof entry.details === 'object' && !Array.isArray(entry.details) ? entry.details : {};
+}
+
+function auditEntryRequestId(entry) {
+  const details = auditEntryDetails(entry);
+  const detailRequestId = normalizeCloudRequestId(details.requestId || details.request_id);
+  if (detailRequestId) return detailRequestId;
+  return normalizeCloudRequestId(entry && entry.targetId);
+}
+
+function saveAndSendStatusFromAuditEntries(entries, requestId) {
+  const normalizedRequestId = normalizeCloudRequestId(requestId);
+  if (!normalizedRequestId) {
+    return {
+      ok: false,
+      status: 'unknown',
+      request_id: '',
+      message: 'Cloud save request id is required.',
+    };
+  }
+  let started = null;
+  let success = null;
+  let failure = null;
+  for (const entry of Array.isArray(entries) ? entries : []) {
+    if (auditEntryRequestId(entry) !== normalizedRequestId) continue;
+    const action = String((entry && entry.action) || '').trim();
+    if (action === SAVE_AND_SEND_AUDIT_ACTION_STARTED) started = entry;
+    if (action === SAVE_AND_SEND_AUDIT_ACTION_SUCCESS) success = entry;
+    if (action === SAVE_AND_SEND_AUDIT_ACTION_FAILED) failure = entry;
+  }
+  if (success) {
+    const details = auditEntryDetails(success);
+    return {
+      ok: true,
+      status: 'confirmed_success',
+      request_id: normalizedRequestId,
+      started_at: String((started && started.at) || details.startedAt || details.started_at || '').trim(),
+      confirmed_at: String((success && success.at) || '').trim(),
+      version: Math.max(0, toInt(details.version, 0)),
+      published_at: String(details.publishedAt || details.published_at || '').trim(),
+      message: String(details.message || 'Cloud synced.').trim() || 'Cloud synced.',
+    };
+  }
+  if (failure) {
+    const details = auditEntryDetails(failure);
+    return {
+      ok: false,
+      status: 'confirmed_failure',
+      request_id: normalizedRequestId,
+      started_at: String((started && started.at) || details.startedAt || details.started_at || '').trim(),
+      confirmed_at: String((failure && failure.at) || '').trim(),
+      code: String(details.code || '').trim(),
+      message: String(details.message || 'Cloud save failed.').trim() || 'Cloud save failed.',
+    };
+  }
+  if (started) {
+    const details = auditEntryDetails(started);
+    return {
+      ok: false,
+      status: 'pending_confirmation',
+      request_id: normalizedRequestId,
+      started_at: String((started && started.at) || details.startedAt || details.started_at || '').trim(),
+      expected_version: Math.max(0, toInt(details.expectedVersion || details.expected_version, 0)),
+      expected_stamp: String(details.expectedStamp || details.expected_stamp || '').trim(),
+      message: 'Cloud save is still being confirmed.',
+    };
+  }
+  return {
+    ok: false,
+    status: 'unknown',
+    request_id: normalizedRequestId,
+    message: 'Cloud save request is not recorded yet.',
+  };
+}
+
+function saveAndSendStatusHttpStatus(status) {
+  if (status === 'pending_confirmation') return 202;
+  if (status === 'unknown') return 404;
+  return 200;
+}
+
+async function readSaveAndSendStatus(pool, requestId) {
+  const state = await readDb(pool);
+  const entries = Array.isArray(state && state.audit) ? state.audit : [];
+  return saveAndSendStatusFromAuditEntries(entries, requestId);
+}
+
 async function insertAuditLogRow(client, entry) {
   const row = entry && typeof entry === 'object' ? entry : {};
   await client.query(
@@ -1657,6 +1756,21 @@ async function createApp(options = {}) {
         res.status(result.status).json(result.body);
         return;
       }
+      if (action === 'save_and_sync_status' || action === 'save_and_send_status') {
+        const permissions = req.auth.payload.permissions || {};
+        if (!permissions.publish_catalog) {
+          res.status(403).json({ ok: false, message: 'Only admins can view cloud save status.' });
+          return;
+        }
+        const requestId = normalizeCloudRequestId(body.request_id);
+        if (!requestId) {
+          res.status(400).json({ ok: false, status: 'unknown', request_id: '', message: 'request_id is required.' });
+          return;
+        }
+        const statusInfo = await readSaveAndSendStatus(db, requestId);
+        res.status(saveAndSendStatusHttpStatus(statusInfo.status)).json(statusInfo);
+        return;
+      }
       if (action === 'catalog_get_live' || action === 'catalog_get_stage') {
         const stage = String(body.stage || 'published').trim() || 'published';
         const state = await readDb(db);
@@ -2136,9 +2250,40 @@ async function createApp(options = {}) {
         return;
       }
       if (action === 'save_and_send') {
-        const result = await withDb(db, async (db) => {
-          const permissions = req.auth.payload.permissions || {};
-          if (!permissions.publish_catalog) return { status: 403, body: { ok: false, message: 'Only admins can publish snapshots.' } };
+        const permissions = req.auth.payload.permissions || {};
+        if (!permissions.publish_catalog) {
+          res.status(403).json({ ok: false, message: 'Only admins can publish snapshots.' });
+          return;
+        }
+        const requestId = normalizeCloudRequestId(body.request_id || randomId('request'));
+        const publishStatus = await readSaveAndSendStatus(db, requestId);
+        if (publishStatus.status === 'confirmed_success' || publishStatus.status === 'pending_confirmation') {
+          res.status(saveAndSendStatusHttpStatus(publishStatus.status)).json(publishStatus);
+          return;
+        }
+        const preflightState = await readDb(db);
+        const currentPublished = preflightState && preflightState.snapshots && preflightState.snapshots.published
+          ? preflightState.snapshots.published
+          : null;
+        const expectedVersion = Math.max(1, toInt(currentPublished && currentPublished.version, 0) + 1);
+        const startedAt = nowIso();
+        await withDb(db, async (state) => {
+          logAudit(state, {
+            action: SAVE_AND_SEND_AUDIT_ACTION_STARTED,
+            actorUserId: req.auth.user.id,
+            actorName: req.auth.user.displayName,
+            targetType: 'snapshot',
+            targetId: requestId,
+            details: {
+              requestId,
+              expectedVersion,
+              expectedStamp: `${startedAt}|${expectedVersion}`,
+            },
+          });
+        });
+        let result = null;
+        try {
+          result = await withDb(db, async (db) => {
           const payload = sanitizeCatalogPayload(body.payload);
           const userOps = normalizeUserOperations(body.user_operations);
           const currentPublished = db.snapshots && db.snapshots.published ? db.snapshots.published : null;
@@ -2154,12 +2299,27 @@ async function createApp(options = {}) {
           db.snapshots.draft = { updatedAt: stamp, updatedByUserId: req.auth.user.id, payload };
           const actor = { userId: req.auth.user.id, name: req.auth.user.displayName };
           userOps.forEach((op) => applyUserOperation(db, op, actor, logAudit));
-          logAudit(db, { action: 'catalog.save_and_send', actorUserId: req.auth.user.id, actorName: req.auth.user.displayName, targetType: 'snapshot', targetId: String(nextVersion), details: { version: nextVersion, userOperations: userOps.length } });
+          logAudit(db, {
+            action: SAVE_AND_SEND_AUDIT_ACTION_SUCCESS,
+            actorUserId: req.auth.user.id,
+            actorName: req.auth.user.displayName,
+            targetType: 'snapshot',
+            targetId: String(nextVersion),
+            details: {
+              requestId,
+              startedAt,
+              version: nextVersion,
+              publishedAt: stamp,
+              userOperations: userOps.length,
+              message: 'Cloud synced.',
+            },
+          });
           return {
             status: 200,
             body: {
               ok: true,
-              request_id: String(body.request_id || randomId('request')).toLowerCase(),
+              status: 'confirmed_success',
+              request_id: requestId,
               message: 'Cloud synced.',
               version: nextVersion,
               published_at: stamp,
@@ -2168,6 +2328,41 @@ async function createApp(options = {}) {
             },
           };
         });
+        } catch (error) {
+          await withDb(db, async (state) => {
+            logAudit(state, {
+              action: SAVE_AND_SEND_AUDIT_ACTION_FAILED,
+              actorUserId: req.auth && req.auth.user ? req.auth.user.id : '',
+              actorName: req.auth && req.auth.user ? req.auth.user.displayName : '',
+              targetType: 'snapshot',
+              targetId: requestId,
+              details: {
+                requestId,
+                startedAt,
+                code: String((error && error.code) || '').trim(),
+                message: String((error && error.message) || 'Cloud save failed.').trim() || 'Cloud save failed.',
+              },
+            });
+          });
+          throw error;
+        }
+        if (!(result && result.status >= 200 && result.status < 300 && result.body && result.body.ok)) {
+          await withDb(db, async (state) => {
+            logAudit(state, {
+              action: SAVE_AND_SEND_AUDIT_ACTION_FAILED,
+              actorUserId: req.auth && req.auth.user ? req.auth.user.id : '',
+              actorName: req.auth && req.auth.user ? req.auth.user.displayName : '',
+              targetType: 'snapshot',
+              targetId: requestId,
+              details: {
+                requestId,
+                startedAt,
+                code: String((result && result.body && result.body.code) || '').trim(),
+                message: String((result && result.body && result.body.message) || 'Cloud save failed.').trim() || 'Cloud save failed.',
+              },
+            });
+          });
+        }
         res.status(result.status || 200).json(result.body || { ok: false, message: 'Cloud sync failed.' });
         return;
       }
