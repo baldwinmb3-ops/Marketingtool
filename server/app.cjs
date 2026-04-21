@@ -20,6 +20,8 @@ const {
   createPoolFromEnv,
   initDatabase,
   readDb,
+  readSnapshotStage,
+  readBookingRows,
   withDb,
   withLockedWriteTransaction,
   listUsers,
@@ -1985,15 +1987,14 @@ async function createApp(options = {}) {
       }
       if (action === 'catalog_get_live' || action === 'catalog_get_stage') {
         const stage = String(body.stage || 'published').trim() || 'published';
-        const state = await readDb(db);
         if (stage === 'published') {
-          const p = state.snapshots && state.snapshots.published ? state.snapshots.published : null;
+          const p = await readSnapshotStage(db, 'published');
           if (!p) { res.status(200).json({ ok: false, message: 'No published cloud snapshot found.' }); return; }
           res.json({ ok: true, row: { stage: 'published', payload: p.payload, updated_at: p.updatedAt, updated_by: p.publishedByUserId }, message: 'Cloud catalog loaded.' });
           return;
         }
         if (stage === 'draft') {
-          const d = state.snapshots && state.snapshots.draft ? state.snapshots.draft : null;
+          const d = await readSnapshotStage(db, 'draft');
           if (!d) { res.status(200).json({ ok: false, message: 'No draft cloud snapshot found.' }); return; }
           res.json({ ok: true, row: { stage: 'draft', payload: d.payload, updated_at: d.updatedAt, updated_by: d.updatedByUserId }, message: 'Cloud draft loaded.' });
           return;
@@ -2035,10 +2036,8 @@ async function createApp(options = {}) {
         return;
       }
       if (action === 'booking_get') {
-        const state = await readDb(db);
-        const requests = Array.isArray(state.bookings)
-          ? state.bookings.filter((entry) => bookingStatus(entry.status) !== 'deleted')
-          : [];
+        const bookingRows = await readBookingRows(db);
+        const requests = bookingRows.filter((entry) => bookingStatus(entry.status) !== 'deleted');
         const locks = requests.map(bookingLockFromRow).filter(Boolean);
         res.json({ ok: true, row: { stage: 'booking_requests', payload: { meta: { source: 'backend', updatedAt: nowIso(), version: 1 }, requests }, updated_at: nowIso(), updated_by: req.auth.user.id }, locks, message: 'Cloud booking queue loaded.' });
         return;

@@ -33,6 +33,30 @@ async function readJson(res) {
   }
 }
 
+function createTransientAggregateError(message = '') {
+  return new AggregateError(
+    [Object.assign(new Error('connect ECONNRESET'), { code: 'ECONNRESET' })],
+    message,
+  );
+}
+
+function installTransientQueryFailure(pool, match) {
+  const originalQuery = pool.query.bind(pool);
+  let remaining = 1;
+  pool.query = async (text, params) => {
+    const sql = typeof text === 'string' ? text : String((text && text.text) || '');
+    const shouldFail = remaining > 0 && (typeof match === 'function' ? !!match(sql, params) : sql.includes(String(match || '')));
+    if (shouldFail) {
+      remaining -= 1;
+      throw createTransientAggregateError();
+    }
+    return originalQuery(text, params);
+  };
+  return () => {
+    pool.query = originalQuery;
+  };
+}
+
 async function setupHarness(appOptions = {}) {
   const mem = newDb({ autoCreateForeignKeyIndices: true, noAstCoverageCheck: true });
   const pgAdapter = mem.adapters.createPg();
@@ -503,6 +527,110 @@ test('cloud save_and_sync_status returns confirmed_success for completed save_an
     const afterPublished = await requestJson(harness, '/api/snapshots/published/latest');
     assert.equal(afterPublished.status, 200, `published snapshot fetch after save failed: ${JSON.stringify(afterPublished.body)}`);
     assert.equal(Number(afterPublished.body.metadata && afterPublished.body.metadata.version), beforeVersion + 1);
+  } finally {
+    await teardownHarness(harness);
+  }
+});
+
+test('cloud booking_get does not 500 immediately after save_and_sync when the shared read path hits a transient AggregateError', async () => {
+  const harness = await setupHarness();
+  let restoreQuery = null;
+  try {
+    await signIn(harness);
+    const published = await requestJson(harness, '/api/snapshots/published/latest');
+    assert.equal(published.status, 200, `published snapshot fetch failed: ${JSON.stringify(published.body)}`);
+
+    const saveSend = await requestJson(harness, '/api/cloud', {
+      method: 'POST',
+      body: {
+        action: 'save_and_sync',
+        payload: published.body.snapshot,
+        request_id: 'post-publish-booking-get-retry',
+      },
+    });
+    assert.equal(saveSend.status, 200, `save_and_sync should succeed before booking_get: ${JSON.stringify(saveSend.body)}`);
+
+    restoreQuery = installTransientQueryFailure(harness.db, 'SELECT row_data FROM bookings ORDER BY created_at ASC');
+
+    const bookingGet = await requestJson(harness, '/api/cloud', {
+      method: 'POST',
+      body: { action: 'booking_get' },
+    });
+
+    assert.equal(bookingGet.status, 200, `booking_get should retry the transient AggregateError: ${JSON.stringify(bookingGet.body)}`);
+    assert.equal(bookingGet.body.ok, true);
+    assert.equal(bookingGet.body.message, 'Cloud booking queue loaded.');
+  } finally {
+    if (restoreQuery) restoreQuery();
+    await teardownHarness(harness);
+  }
+});
+
+test('cloud catalog_get_live does not 500 immediately after save_and_sync when the shared read path hits a transient AggregateError', async () => {
+  const harness = await setupHarness();
+  let restoreQuery = null;
+  try {
+    await signIn(harness);
+    const published = await requestJson(harness, '/api/snapshots/published/latest');
+    assert.equal(published.status, 200, `published snapshot fetch failed: ${JSON.stringify(published.body)}`);
+
+    const saveSend = await requestJson(harness, '/api/cloud', {
+      method: 'POST',
+      body: {
+        action: 'save_and_sync',
+        payload: published.body.snapshot,
+        request_id: 'post-publish-catalog-get-retry',
+      },
+    });
+    assert.equal(saveSend.status, 200, `save_and_sync should succeed before catalog_get_live: ${JSON.stringify(saveSend.body)}`);
+
+    restoreQuery = installTransientQueryFailure(harness.db, 'SELECT * FROM snapshot_published_current WHERE id = TRUE LIMIT 1');
+
+    const catalogGet = await requestJson(harness, '/api/cloud', {
+      method: 'POST',
+      body: { action: 'catalog_get_live' },
+    });
+
+    assert.equal(catalogGet.status, 200, `catalog_get_live should retry the transient AggregateError: ${JSON.stringify(catalogGet.body)}`);
+    assert.equal(catalogGet.body.ok, true);
+    assert.equal(catalogGet.body.message, 'Cloud catalog loaded.');
+  } finally {
+    if (restoreQuery) restoreQuery();
+    await teardownHarness(harness);
+  }
+});
+
+test('cloud booking_get and catalog_get_live remain stable immediately after a normal save_and_sync', async () => {
+  const harness = await setupHarness();
+  try {
+    await signIn(harness);
+    const published = await requestJson(harness, '/api/snapshots/published/latest');
+    assert.equal(published.status, 200, `published snapshot fetch failed: ${JSON.stringify(published.body)}`);
+
+    const saveSend = await requestJson(harness, '/api/cloud', {
+      method: 'POST',
+      body: {
+        action: 'save_and_sync',
+        payload: published.body.snapshot,
+        request_id: 'post-publish-follow-up-stability',
+      },
+    });
+    assert.equal(saveSend.status, 200, `save_and_sync should succeed before follow-up reads: ${JSON.stringify(saveSend.body)}`);
+    assert.equal(saveSend.body.ok, true);
+
+    const bookingGet = await requestJson(harness, '/api/cloud', {
+      method: 'POST',
+      body: { action: 'booking_get' },
+    });
+    assert.equal(bookingGet.status, 200, `booking_get should remain stable after save_and_sync: ${JSON.stringify(bookingGet.body)}`);
+    assert.equal(bookingGet.body.ok, true);
+
+    const catalogGet = await requestJson(harness, '/api/cloud', {
+      method: 'POST',
+      body: { action: 'catalog_get_live' },
+    });
+    assert.equal(catalogGet.status, 200, `catalog_get_live should remain stable after save_and_sync: ${JSON.stringify(catalogGet.body)}`);
+    assert.equal(catalogGet.body.ok, true);
   } finally {
     await teardownHarness(harness);
   }

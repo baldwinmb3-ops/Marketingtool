@@ -19,6 +19,8 @@ const MIGRATION_SQL = fs.readFileSync(MIGRATION_SQL_PATH, 'utf8');
 const DB_QUEUE_BY_POOL = new WeakMap();
 const SESSION_CACHE_BY_POOL = new WeakMap();
 const SESSION_CACHE_TTL_MS = 10_000;
+const READ_RETRY_ATTEMPTS = 3;
+const READ_RETRY_BASE_DELAY_MS = 75;
 
 function toIso(value, fallback = nowIso()) {
   const date = new Date(value || fallback);
@@ -42,6 +44,76 @@ function asJson(value, fallback) {
     }
   }
   return fallback;
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function nestedReadErrors(error) {
+  if (!error) return [];
+  if (Array.isArray(error.errors)) {
+    return error.errors.flatMap((entry) => nestedReadErrors(entry));
+  }
+  return [error];
+}
+
+function retryableReadMessage(error) {
+  return String((error && error.message) || error || '').trim().toLowerCase();
+}
+
+function retryableReadCode(error) {
+  return String((error && error.code) || '').trim().toUpperCase();
+}
+
+function isRetryableReadError(error) {
+  const queue = [error, ...nestedReadErrors(error)];
+  return queue.some((entry) => {
+    const code = retryableReadCode(entry);
+    const name = String((entry && entry.name) || '').trim();
+    const message = retryableReadMessage(entry);
+    if (name === 'AggregateError') return true;
+    if ([
+      'ECONNRESET',
+      'ECONNREFUSED',
+      'ETIMEDOUT',
+      'EHOSTUNREACH',
+      'ENETUNREACH',
+      '57P01',
+      '57P02',
+      '57P03',
+      '53300',
+      '08000',
+      '08001',
+      '08003',
+      '08006',
+    ].includes(code)) return true;
+    return (
+      message.includes('aggregateerror') ||
+      message.includes('connection terminated unexpectedly') ||
+      message.includes('connection ended unexpectedly') ||
+      message.includes('connect econnrefused') ||
+      message.includes('connect etimedout')
+    );
+  });
+}
+
+async function runReadWithRetry(task, options = {}) {
+  const attempts = Math.max(1, Number.parseInt(String(options.attempts || READ_RETRY_ATTEMPTS), 10) || READ_RETRY_ATTEMPTS);
+  const baseDelayMs = Math.max(0, Number.parseInt(String(options.baseDelayMs || READ_RETRY_BASE_DELAY_MS), 10) || READ_RETRY_BASE_DELAY_MS);
+  let attempt = 0;
+  while (attempt < attempts) {
+    try {
+      return await task();
+    } catch (error) {
+      attempt += 1;
+      if (attempt >= attempts || !isRetryableReadError(error)) {
+        throw error;
+      }
+      await sleep(baseDelayMs * attempt);
+    }
+  }
+  return task();
 }
 
 function sessionCacheForPool(pool) {
@@ -719,6 +791,44 @@ async function readDbInternal(client) {
   };
 }
 
+async function readSnapshotStage(pool, stage = 'published') {
+  const targetStage = String(stage || 'published').trim() || 'published';
+  return runReadWithRetry(async () => {
+    if (targetStage === 'published') {
+      const result = await pool.query('SELECT * FROM snapshot_published_current WHERE id = TRUE LIMIT 1');
+      const row = result.rows[0] || null;
+      return row
+        ? {
+            version: Number.parseInt(String(row.version || '1'), 10) || 1,
+            publishedAt: toIso(row.published_at),
+            updatedAt: toIso(row.updated_at),
+            publishedByUserId: String(row.published_by_user_id || ''),
+            payload: asJson(row.payload, {}),
+          }
+        : null;
+    }
+    if (targetStage === 'draft') {
+      const result = await pool.query('SELECT * FROM snapshot_draft WHERE id = TRUE LIMIT 1');
+      const row = result.rows[0] || null;
+      return row
+        ? {
+            updatedAt: toIso(row.updated_at),
+            updatedByUserId: String(row.updated_by_user_id || ''),
+            payload: asJson(row.payload, {}),
+          }
+        : null;
+    }
+    return null;
+  });
+}
+
+async function readBookingRows(pool) {
+  return runReadWithRetry(async () => {
+    const result = await pool.query('SELECT row_data FROM bookings ORDER BY created_at ASC');
+    return result.rows.map((row) => asJson(row.row_data, null)).filter(Boolean);
+  });
+}
+
 async function upsertUserRow(client, user) {
   const row = user && typeof user === 'object' ? user : {};
   await client.query(
@@ -1026,12 +1136,14 @@ async function initDatabase(pool, options = {}) {
 }
 
 async function readDb(pool) {
-  const client = await pool.connect();
-  try {
-    return await readDbInternal(client);
-  } finally {
-    client.release();
-  }
+  return runReadWithRetry(async () => {
+    const client = await pool.connect();
+    try {
+      return await readDbInternal(client);
+    } finally {
+      client.release();
+    }
+  });
 }
 
 async function withDb(pool, task) {
@@ -1308,6 +1420,8 @@ module.exports = {
   seedDatabase,
   initDatabase,
   readDb,
+  readSnapshotStage,
+  readBookingRows,
   withDb,
   withLockedWriteTransaction,
   findUserByIdentifier,
