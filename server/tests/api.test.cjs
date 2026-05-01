@@ -1073,6 +1073,127 @@ test('cloud save_and_sync blocks stale 73-brand seed/default payload before publ
   }
 });
 
+test('admin publish allows schedule-preserving publish when base version matches current', async () => {
+  const harness = await setupHarness();
+  try {
+    await signIn(harness);
+    const initial = await latestPublishedSnapshot(harness);
+    const scheduledPayload = buildScheduledCatalogPayload(initial.body.snapshot);
+    await seedPublishedSnapshot(harness.db, scheduledPayload, 2);
+
+    const safePayload = deepClone(scheduledPayload);
+    const brandId = safePayload.brands[0] && safePayload.brands[0].id;
+    const brand = safePayload.brands.find((entry) => entry.id === brandId);
+    brand.displayName = `${brand.displayName || brand.name || 'Brand'} Updated`;
+
+    const publish = await requestJson(harness, '/api/admin/publish', {
+      method: 'POST',
+      body: {
+        payload: safePayload,
+        base_snapshot_version: 2,
+      },
+    });
+
+    assert.equal(publish.status, 200, `Schedule-preserving admin publish should pass: ${JSON.stringify(publish.body)}`);
+    assert.equal(publish.body.ok, true);
+    assert.equal(Number(publish.body.version), 3);
+
+    const afterPublished = await latestPublishedSnapshot(harness);
+    assert.equal(Number(afterPublished.body.metadata && afterPublished.body.metadata.version), 3);
+    assert.equal(afterPublished.body.snapshot.brands[0].displayName, brand.displayName);
+
+    const audit = await latestAuditByAction(harness.db, 'catalog.publish');
+    assert.ok(audit, 'Expected catalog.publish audit entry');
+    assert.equal(Number((audit.details && audit.details.version) || 0), 3);
+  } finally {
+    await teardownHarness(harness);
+  }
+});
+
+test('admin publish blocks destructive schedule loss and leaves published and draft unchanged', async () => {
+  const harness = await setupHarness();
+  try {
+    await signIn(harness);
+    const initial = await latestPublishedSnapshot(harness);
+    const scheduledPayload = buildScheduledCatalogPayload(initial.body.snapshot);
+    await seedPublishedSnapshot(harness.db, scheduledPayload, 2);
+    const beforeState = await readDb(harness.db);
+
+    const destructivePayload = deepClone(scheduledPayload);
+    const firstBrand = destructivePayload.brands[0];
+    setBrandSchedule(destructivePayload, firstBrand.id, []);
+
+    const publish = await requestJson(harness, '/api/admin/publish', {
+      method: 'POST',
+      body: {
+        payload: destructivePayload,
+        base_snapshot_version: 2,
+      },
+    });
+
+    assert.equal(publish.status, 409, `Destructive admin publish should be blocked: ${JSON.stringify(publish.body)}`);
+    assert.equal(publish.body.ok, false);
+    assert.equal(publish.body.code, DESTRUCTIVE_PUBLISH_BLOCKED_CODE);
+    assert.ok(Array.isArray(publish.body.affected_brands) && publish.body.affected_brands.length > 0);
+
+    const afterPublished = await latestPublishedSnapshot(harness);
+    assert.equal(Number(afterPublished.body.metadata && afterPublished.body.metadata.version), 2);
+    assert.deepEqual(afterPublished.body.snapshot, beforeState.snapshots.published.payload);
+
+    const afterState = await readDb(harness.db);
+    assert.deepEqual(afterState.snapshots.draft.payload, beforeState.snapshots.draft.payload);
+
+    const audit = await latestAuditByAction(harness.db, 'catalog.publish_blocked');
+    assert.ok(audit, 'Expected blocked admin publish audit entry');
+    assert.equal(String((audit.details && audit.details.code) || ''), DESTRUCTIVE_PUBLISH_BLOCKED_CODE);
+  } finally {
+    await teardownHarness(harness);
+  }
+});
+
+test('admin publish blocks stale 73-brand seed/default payload before publish', async () => {
+  const harness = await setupHarness();
+  try {
+    await signIn(harness);
+    const initial = await latestPublishedSnapshot(harness);
+    const scheduledPayload = buildScheduledCatalogPayload(initial.body.snapshot);
+    await seedPublishedSnapshot(harness.db, scheduledPayload, 2);
+    const beforeState = await readDb(harness.db);
+
+    const stalePayload = deepClone(initial.body.snapshot);
+    stalePayload.meta = Object.assign({}, stalePayload.meta || {}, { version: 1 });
+    stalePayload.brands = Array.from({ length: 73 }, (_, index) => ({
+      id: `brand-stale-${index + 1}`,
+      name: `Stale Brand ${index + 1}`,
+      displayName: `Stale Brand ${index + 1}`,
+      active: true,
+      showScheduleDates: {},
+      showScheduleStatus: {},
+    }));
+
+    const publish = await requestJson(harness, '/api/admin/publish', {
+      method: 'POST',
+      body: {
+        payload: stalePayload,
+        base_snapshot_version: 1,
+      },
+    });
+
+    assert.equal(publish.status, 409, `Stale admin publish should be blocked: ${JSON.stringify(publish.body)}`);
+    assert.equal(publish.body.ok, false);
+    assert.equal(publish.body.code, PUBLISH_BASE_VERSION_STALE_CODE);
+
+    const afterPublished = await latestPublishedSnapshot(harness);
+    assert.equal(Number(afterPublished.body.metadata && afterPublished.body.metadata.version), 2);
+    assert.deepEqual(afterPublished.body.snapshot, beforeState.snapshots.published.payload);
+
+    const afterState = await readDb(harness.db);
+    assert.deepEqual(afterState.snapshots.draft.payload, beforeState.snapshots.draft.payload);
+  } finally {
+    await teardownHarness(harness);
+  }
+});
+
 test('catalog restore snapshot requires explicit confirmation and supports draft preview then published restore', async () => {
   const harness = await setupHarness();
   try {
@@ -1194,6 +1315,18 @@ test('smoke admin publish is blocked on production-like runtime unless explicitl
       assert.equal(saveSend.status, 403, `Smoke admin publish should be blocked: ${JSON.stringify(saveSend.body)}`);
       assert.equal(saveSend.body.ok, false);
       assert.equal(saveSend.body.code, SMOKE_PUBLISH_BLOCKED_CODE);
+
+      const legacyPublish = await requestJson(harness, '/api/admin/publish', {
+        method: 'POST',
+        body: {
+          payload: published.body.snapshot,
+          base_snapshot_version: 1,
+        },
+      });
+
+      assert.equal(legacyPublish.status, 403, `Smoke admin legacy publish should be blocked: ${JSON.stringify(legacyPublish.body)}`);
+      assert.equal(legacyPublish.body.ok, false);
+      assert.equal(legacyPublish.body.code, SMOKE_PUBLISH_BLOCKED_CODE);
     } finally {
       await teardownHarness(harness);
     }

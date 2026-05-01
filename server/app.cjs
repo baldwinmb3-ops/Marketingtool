@@ -1585,23 +1585,96 @@ async function createApp(options = {}) {
 
   app.post('/api/admin/publish', requireSession, requirePermission('publish_catalog'), async (req, res, next) => {
     try {
-      await withDb(db, async (db) => {
-        if (!db.snapshots || typeof db.snapshots !== 'object') db.snapshots = {};
-        const currentPublished = db.snapshots.published || { version: 0, payload: createSeedDb().snapshots.published.payload };
-        const payload = req.body && req.body.payload ? sanitizeCatalogPayload(req.body.payload) : db.snapshots.draft && db.snapshots.draft.payload ? sanitizeCatalogPayload(db.snapshots.draft.payload) : sanitizeCatalogPayload(currentPublished.payload);
-        const nextVersion = Math.max(1, toInt(currentPublished.version, 0) + 1);
-        const stamp = nowIso();
-        payload.meta = payload.meta && typeof payload.meta === 'object' ? payload.meta : {};
-        payload.meta.version = nextVersion;
-        payload.meta.publishedAt = stamp;
-        payload.meta.updatedAt = stamp;
-        const nextPublished = { version: nextVersion, publishedAt: stamp, updatedAt: stamp, publishedByUserId: req.auth.user.id, payload };
-        db.snapshots.published = nextPublished;
-        if (!Array.isArray(db.snapshots.history)) db.snapshots.history = [];
-        db.snapshots.history.push(nextPublished);
-        db.snapshots.draft = { updatedAt: stamp, updatedByUserId: req.auth.user.id, payload };
-        logAudit(db, { action: 'catalog.publish', actorUserId: req.auth.user.id, actorName: req.auth.user.displayName, targetType: 'snapshot', targetId: String(nextVersion), details: { version: nextVersion } });
-        res.json({ ok: true, version: nextVersion, published_at: stamp, metadata: { version: nextVersion, publishedAt: stamp, updatedAt: stamp }, snapshot: payload });
+      const actorUser = req && req.auth ? req.auth.user : null;
+      const actor = {
+        userId: actorUser && actorUser.id ? actorUser.id : '',
+        name: actorUser && actorUser.displayName ? actorUser.displayName : '',
+      };
+      const smokeBlock = smokePublishBlockForUser(actorUser);
+      if (smokeBlock) {
+        const currentPublished = await readSnapshotStage(db, 'published');
+        const currentSummary = buildCatalogScheduleSummary(currentPublished && currentPublished.payload);
+        res.status(smokeBlock.status).json(
+          publishBlockedResponse(smokeBlock, {
+            currentVersion: Math.max(1, toInt(currentPublished && currentPublished.version, 0)),
+            baseVersion: 0,
+            impact: {
+              before: currentSummary.counts,
+              after: currentSummary.counts,
+              affectedBrands: [],
+            },
+          }),
+        );
+        return;
+      }
+
+      const currentPublished = await readSnapshotStage(db, 'published');
+      const currentDraft = await readSnapshotStage(db, 'draft');
+      const fallbackPayload =
+        req.body && req.body.payload
+          ? req.body.payload
+          : currentDraft && currentDraft.payload
+            ? currentDraft.payload
+            : currentPublished && currentPublished.payload
+              ? currentPublished.payload
+              : createSeedDb().snapshots.published.payload;
+      const publishResult = await publishSaveAndSendSnapshot(db, {
+        payload: fallbackPayload,
+        actor,
+        explicitBaseVersion: req.body && req.body.base_snapshot_version,
+      });
+      if (publishResult && publishResult.blocked) {
+        await appendAuditLogEntry(db, {
+          action: 'catalog.publish_blocked',
+          actorUserId: actor.userId,
+          actorName: actor.name,
+          targetType: 'snapshot',
+          targetId: String((publishResult.body && publishResult.body.current_published_version) || ''),
+          details: {
+            code: String((publishResult.body && publishResult.body.code) || '').trim(),
+            message: String((publishResult.body && publishResult.body.message) || 'Publish blocked.').trim(),
+            currentVersion: Math.max(0, toInt(publishResult.body && publishResult.body.current_published_version, 0)),
+            baseVersion: Math.max(0, toInt(publishResult.body && publishResult.body.base_snapshot_version, 0)),
+            scheduleCounts:
+              publishResult.body && publishResult.body.schedule_counts && typeof publishResult.body.schedule_counts === 'object'
+                ? publishResult.body.schedule_counts
+                : undefined,
+            affectedBrands:
+              publishResult.body && Array.isArray(publishResult.body.affected_brands)
+                ? publishResult.body.affected_brands
+                : undefined,
+          },
+        });
+        res.status(publishResult.status).json(publishResult.body);
+        return;
+      }
+
+      await appendAuditLogEntry(db, {
+        action: 'catalog.publish',
+        actorUserId: actor.userId,
+        actorName: actor.name,
+        targetType: 'snapshot',
+        targetId: String(publishResult.version),
+        details: {
+          version: publishResult.version,
+          publishedAt: publishResult.publishedAt,
+        },
+      });
+      const publishedSnapshot = await readSnapshotStage(db, 'published');
+      const version = Math.max(1, toInt(publishedSnapshot && publishedSnapshot.version, publishResult.version));
+      const publishedAt = String(
+        (publishedSnapshot && (publishedSnapshot.publishedAt || publishedSnapshot.updatedAt)) || publishResult.publishedAt || '',
+      ).trim();
+      res.json({
+        ok: true,
+        version,
+        published_at: publishedAt,
+        metadata: {
+          version,
+          publishedAt,
+          updatedAt: String((publishedSnapshot && publishedSnapshot.updatedAt) || publishedAt).trim(),
+        },
+        snapshot: publishedSnapshot && publishedSnapshot.payload ? publishedSnapshot.payload : sanitizeCatalogPayload(fallbackPayload),
       });
     } catch (error) {
       next(error);
