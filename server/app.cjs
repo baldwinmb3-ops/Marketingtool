@@ -41,6 +41,18 @@ const {
 } = require('./db.cjs');
 const { deriveAccess, buildSessionPayload } = require('./authz.cjs');
 const { latestValidatedBackup } = require('./backup-safety.cjs');
+const { databaseLooksProductionLike } = require('./db-safety.cjs');
+const {
+  SMOKE_PUBLISH_BLOCKED_CODE,
+  SMOKE_PUBLISH_BLOCKED_MESSAGE,
+  assessCatalogPublishSafety,
+  buildCatalogScheduleSummary,
+  buildRecoveryConfirmationToken,
+  diffCatalogScheduleImpact,
+  looksLikeSmokePublishActor,
+  isPrimaryAdminUser,
+  smokePublishOverrideAccepted,
+} = require('./catalog-publish-guard.cjs');
 const {
   sanitizeCatalogPayload,
   recomputePricing,
@@ -281,6 +293,67 @@ async function readSaveAndSendStatus(pool, requestId) {
   return saveAndSendStatusFromAuditEntries(entries, normalizedRequestId);
 }
 
+function cloneCatalogPayload(payload) {
+  const src = payload && typeof payload === 'object' ? payload : {};
+  return JSON.parse(JSON.stringify(src));
+}
+
+function publishScheduleCounts(assessment) {
+  const impact = assessment && assessment.impact && typeof assessment.impact === 'object' ? assessment.impact : {};
+  return {
+    before: impact.before || {
+      totalScheduledSlots: 0,
+      totalStatusEntries: 0,
+      scheduledBrandCount: 0,
+      statusBrandCount: 0,
+      activeScheduledBrandCount: 0,
+    },
+    after: impact.after || {
+      totalScheduledSlots: 0,
+      totalStatusEntries: 0,
+      scheduledBrandCount: 0,
+      statusBrandCount: 0,
+      activeScheduledBrandCount: 0,
+    },
+  };
+}
+
+function publishBlockedResponse(block, assessment, extras = {}) {
+  return {
+    ok: false,
+    code: String((block && block.code) || 'PUBLISH_BLOCKED').trim() || 'PUBLISH_BLOCKED',
+    message: String((block && block.message) || 'Publish blocked.').trim() || 'Publish blocked.',
+    current_published_version: Math.max(0, toInt(assessment && assessment.currentVersion, 0)),
+    base_snapshot_version: Math.max(0, toInt(assessment && assessment.baseVersion, 0)),
+    schedule_counts: publishScheduleCounts(assessment),
+    affected_brands:
+      assessment && assessment.impact && Array.isArray(assessment.impact.affectedBrands)
+        ? assessment.impact.affectedBrands
+        : [],
+    ...extras,
+  };
+}
+
+function smokePublishBlockForUser(user) {
+  if (!databaseLooksProductionLike()) return null;
+  if (!looksLikeSmokePublishActor(user) || smokePublishOverrideAccepted()) return null;
+  return {
+    status: 403,
+    code: SMOKE_PUBLISH_BLOCKED_CODE,
+    message: SMOKE_PUBLISH_BLOCKED_MESSAGE,
+  };
+}
+
+function normalizeRecoveryTarget(value) {
+  return String(value || '').trim().toLowerCase() === 'draft' ? 'draft' : 'published';
+}
+
+function findSnapshotHistoryVersion(dbState, sourceVersion) {
+  const targetVersion = Math.max(1, toInt(sourceVersion, 0));
+  const history = dbState && dbState.snapshots && Array.isArray(dbState.snapshots.history) ? dbState.snapshots.history : [];
+  return history.find((entry) => toInt(entry && entry.version, 0) === targetVersion) || null;
+}
+
 async function insertAuditLogRow(client, entry) {
   const row = entry && typeof entry === 'object' ? entry : {};
   await client.query(
@@ -395,12 +468,30 @@ async function publishSaveAndSendSnapshot(pool, options = {}) {
   const payload = sanitizeCatalogPayload(options.payload);
   return withLockedWriteTransaction(pool, async (client) => {
     const currentPublished = await client.query(
-      'SELECT version FROM snapshot_published_current WHERE id = TRUE LIMIT 1 FOR UPDATE',
+      'SELECT version, payload FROM snapshot_published_current WHERE id = TRUE LIMIT 1 FOR UPDATE',
     );
+    const currentPublishedRow = currentPublished.rows[0] || null;
     const currentVersion = Math.max(
       0,
-      toInt(currentPublished.rows[0] && currentPublished.rows[0].version, 0),
+      toInt(currentPublishedRow && currentPublishedRow.version, 0),
     );
+    const currentPayload = currentPublishedRow ? parseJsonBody(currentPublishedRow.payload, {}) : {};
+    const currentSnapshot = {
+      version: currentVersion,
+      payload: currentPayload,
+    };
+    const assessment = assessCatalogPublishSafety({
+      currentPublished: currentSnapshot,
+      incomingPayload: payload,
+      explicitBaseVersion: options.explicitBaseVersion,
+    });
+    if (assessment.block) {
+      return {
+        blocked: true,
+        status: assessment.block.status,
+        body: publishBlockedResponse(assessment.block, assessment),
+      };
+    }
     const nextVersion = Math.max(1, currentVersion + 1);
     const stamp = nowIso();
     payload.meta = payload.meta && typeof payload.meta === 'object' ? payload.meta : {};
@@ -467,6 +558,7 @@ async function publishSaveAndSendSnapshot(pool, options = {}) {
     );
 
     return {
+      blocked: false,
       requestId,
       startedAt,
       version: nextVersion,
@@ -2491,48 +2583,74 @@ async function createApp(options = {}) {
         }
         let result = null;
         try {
-          const publishResult = await publishSaveAndSendSnapshot(db, {
-            payload,
-            userOps,
-            actor,
-            requestId,
-            startedAt,
-          });
-          if (userOps.length) {
-            await runQueuedSaveAndSendUserOperations(db, {
+          const smokeBlock = smokePublishBlockForUser(req && req.auth ? req.auth.user : null);
+          if (smokeBlock) {
+            const currentPublished = await readSnapshotStage(db, 'published');
+            const currentSummary = buildCatalogScheduleSummary(currentPublished && currentPublished.payload);
+            result = {
+              status: smokeBlock.status,
+              body: publishBlockedResponse(smokeBlock, {
+                currentVersion: Math.max(1, toInt(currentPublished && currentPublished.version, 0)),
+                baseVersion: 0,
+                impact: {
+                  before: currentSummary.counts,
+                  after: currentSummary.counts,
+                  affectedBrands: [],
+                },
+              }),
+            };
+          } else {
+            const publishResult = await publishSaveAndSendSnapshot(db, {
+              payload,
               userOps,
               actor,
               requestId,
-            });
-          }
-          await appendAuditLogEntry(db, {
-            action: SAVE_AND_SEND_AUDIT_ACTION_SUCCESS,
-            actorUserId: actor.userId,
-            actorName: actor.name,
-            targetType: 'snapshot',
-            targetId: String(publishResult.version),
-            details: {
-              requestId,
               startedAt,
-              version: publishResult.version,
-              publishedAt: publishResult.publishedAt,
-              userOperations: userOps.length,
-              message: 'Cloud synced.',
-            },
-          });
-          result = {
-            status: 200,
-            body: {
-              ok: true,
-              status: 'confirmed_success',
-              request_id: requestId,
-              message: 'Cloud synced.',
-              version: publishResult.version,
-              published_at: publishResult.publishedAt,
-              account_readiness: { pending: 0, ready: userOps.filter((op) => op && op.op === 'create_user').length, failed: 0 },
-              user_operations: { received: userOps.length, queued: userOps.length },
-            },
-          };
+              explicitBaseVersion: body.base_snapshot_version,
+            });
+            if (publishResult && publishResult.blocked) {
+              result = {
+                status: publishResult.status,
+                body: publishResult.body,
+              };
+            } else {
+              if (userOps.length) {
+                await runQueuedSaveAndSendUserOperations(db, {
+                  userOps,
+                  actor,
+                  requestId,
+                });
+              }
+              await appendAuditLogEntry(db, {
+                action: SAVE_AND_SEND_AUDIT_ACTION_SUCCESS,
+                actorUserId: actor.userId,
+                actorName: actor.name,
+                targetType: 'snapshot',
+                targetId: String(publishResult.version),
+                details: {
+                  requestId,
+                  startedAt,
+                  version: publishResult.version,
+                  publishedAt: publishResult.publishedAt,
+                  userOperations: userOps.length,
+                  message: 'Cloud synced.',
+                },
+              });
+              result = {
+                status: 200,
+                body: {
+                  ok: true,
+                  status: 'confirmed_success',
+                  request_id: requestId,
+                  message: 'Cloud synced.',
+                  version: publishResult.version,
+                  published_at: publishResult.publishedAt,
+                  account_readiness: { pending: 0, ready: userOps.filter((op) => op && op.op === 'create_user').length, failed: 0 },
+                  user_operations: { received: userOps.length, queued: userOps.length },
+                },
+              };
+            }
+          }
         } catch (error) {
           await appendAuditLogEntry(db, {
             action: SAVE_AND_SEND_AUDIT_ACTION_FAILED,
@@ -2545,6 +2663,14 @@ async function createApp(options = {}) {
               startedAt,
               code: String((error && error.code) || '').trim(),
               message: String((error && error.message) || 'Cloud save failed.').trim() || 'Cloud save failed.',
+              currentVersion: Math.max(0, toInt(error && error.currentVersion, 0)),
+              baseVersion: Math.max(0, toInt(error && error.baseVersion, 0)),
+              scheduleCounts:
+                error && error.scheduleCounts && typeof error.scheduleCounts === 'object'
+                  ? error.scheduleCounts
+                  : undefined,
+              affectedBrands:
+                error && Array.isArray(error.affectedBrands) ? error.affectedBrands : undefined,
             },
           });
           throw error;
@@ -2561,10 +2687,181 @@ async function createApp(options = {}) {
               startedAt,
               code: String((result && result.body && result.body.code) || '').trim(),
               message: String((result && result.body && result.body.message) || 'Cloud save failed.').trim() || 'Cloud save failed.',
+              currentVersion: Math.max(0, toInt(result && result.body && result.body.current_published_version, 0)),
+              baseVersion: Math.max(0, toInt(result && result.body && result.body.base_snapshot_version, 0)),
+              scheduleCounts:
+                result && result.body && result.body.schedule_counts && typeof result.body.schedule_counts === 'object'
+                  ? result.body.schedule_counts
+                  : undefined,
+              affectedBrands:
+                result && result.body && Array.isArray(result.body.affected_brands) ? result.body.affected_brands : undefined,
             },
           });
         }
         res.status(result.status || 200).json(result.body || { ok: false, message: 'Cloud sync failed.' });
+        return;
+      }
+      if (action === 'catalog_restore_snapshot') {
+        const permissions = req.auth.payload.permissions || {};
+        if (!permissions.publish_catalog) {
+          res.status(403).json({ ok: false, message: 'Only admins can restore catalog snapshots.' });
+          return;
+        }
+        const actorUser = req && req.auth ? req.auth.user : null;
+        if (!isPrimaryAdminUser(actorUser)) {
+          res.status(403).json({
+            ok: false,
+            code: 'PRIMARY_ADMIN_REQUIRED',
+            message: 'Only Primary Admin can restore catalog snapshots.',
+          });
+          return;
+        }
+        const smokeBlock = smokePublishBlockForUser(actorUser);
+        if (smokeBlock) {
+          res.status(smokeBlock.status).json({ ok: false, code: smokeBlock.code, message: smokeBlock.message });
+          return;
+        }
+
+        const sourceVersion = toInt(
+          body.source_snapshot_version || body.restore_snapshot_version || body.snapshot_version || body.version,
+          0,
+        );
+        if (sourceVersion <= 0) {
+          res.status(400).json({
+            ok: false,
+            code: 'RECOVERY_SNAPSHOT_VERSION_REQUIRED',
+            message: 'source_snapshot_version is required for catalog restore.',
+          });
+          return;
+        }
+
+        const target = normalizeRecoveryTarget(body.recovery_target || body.restore_target || body.target);
+        const expectedConfirmationToken = buildRecoveryConfirmationToken(sourceVersion, target);
+        const confirmationToken = String(
+          body.confirmation_token || body.restore_confirmation || body.confirmation || '',
+        ).trim();
+        if (confirmationToken !== expectedConfirmationToken) {
+          res.status(400).json({
+            ok: false,
+            code: 'RECOVERY_CONFIRMATION_REQUIRED',
+            message: 'Recovery confirmation token is required for snapshot restore.',
+            expected_confirmation_token: expectedConfirmationToken,
+          });
+          return;
+        }
+
+        const result = await withDb(db, async (dbState) => {
+          if (!dbState.snapshots || typeof dbState.snapshots !== 'object') dbState.snapshots = {};
+          const currentPublished = dbState.snapshots.published || { version: 0, payload: createSeedDb().snapshots.published.payload };
+          const sourceSnapshot = findSnapshotHistoryVersion(dbState, sourceVersion);
+          if (!(sourceSnapshot && sourceSnapshot.payload)) {
+            return {
+              status: 404,
+              body: {
+                ok: false,
+                code: 'RECOVERY_SNAPSHOT_NOT_FOUND',
+                message: `Snapshot version ${sourceVersion} was not found.`,
+              },
+            };
+          }
+
+          const currentPayload =
+            currentPublished && currentPublished.payload && typeof currentPublished.payload === 'object'
+              ? currentPublished.payload
+              : createSeedDb().snapshots.published.payload;
+          const restoredPayload = sanitizeCatalogPayload(cloneCatalogPayload(sourceSnapshot.payload));
+          const recoveryImpact = diffCatalogScheduleImpact(currentPayload, restoredPayload);
+          const previousPublishedVersion = Math.max(1, toInt(currentPublished && currentPublished.version, 0));
+          const scheduleCounts = {
+            before: recoveryImpact.before,
+            after: recoveryImpact.after,
+          };
+          const commonAuditDetails = {
+            sourceVersion,
+            previousPublishedVersion,
+            scheduleCounts,
+            affectedBrands: recoveryImpact.affectedBrands,
+            target,
+          };
+
+          if (target === 'draft') {
+            dbState.snapshots.draft = {
+              updatedAt: nowIso(),
+              updatedByUserId: req.auth.user.id,
+              payload: restoredPayload,
+            };
+            logAudit(dbState, {
+              action: 'catalog.restore_snapshot_draft',
+              actorUserId: req.auth.user.id,
+              actorName: req.auth.user.displayName,
+              targetType: 'snapshot_draft',
+              targetId: 'draft',
+              details: commonAuditDetails,
+            });
+            return {
+              status: 200,
+              body: {
+                ok: true,
+                message: `Snapshot version ${sourceVersion} restored to draft.`,
+                target: 'draft',
+                source_snapshot_version: sourceVersion,
+                previous_published_version: previousPublishedVersion,
+                schedule_counts: scheduleCounts,
+                affected_brands: recoveryImpact.affectedBrands,
+              },
+            };
+          }
+
+          const nextVersion = Math.max(1, previousPublishedVersion + 1);
+          const stamp = nowIso();
+          restoredPayload.meta = restoredPayload.meta && typeof restoredPayload.meta === 'object' ? restoredPayload.meta : {};
+          restoredPayload.meta.version = nextVersion;
+          restoredPayload.meta.publishedAt = stamp;
+          restoredPayload.meta.updatedAt = stamp;
+          const publishedPayload = sanitizeCatalogPayload(cloneCatalogPayload(restoredPayload));
+          const draftPayload = sanitizeCatalogPayload(cloneCatalogPayload(restoredPayload));
+          dbState.snapshots.published = {
+            version: nextVersion,
+            publishedAt: stamp,
+            updatedAt: stamp,
+            publishedByUserId: req.auth.user.id,
+            payload: publishedPayload,
+          };
+          if (!Array.isArray(dbState.snapshots.history)) dbState.snapshots.history = [];
+          dbState.snapshots.history.push(dbState.snapshots.published);
+          dbState.snapshots.draft = {
+            updatedAt: stamp,
+            updatedByUserId: req.auth.user.id,
+            payload: draftPayload,
+          };
+          logAudit(dbState, {
+            action: 'catalog.restore_snapshot_publish',
+            actorUserId: req.auth.user.id,
+            actorName: req.auth.user.displayName,
+            targetType: 'snapshot',
+            targetId: String(nextVersion),
+            details: {
+              ...commonAuditDetails,
+              restoredVersion: nextVersion,
+              publishedAt: stamp,
+            },
+          });
+          return {
+            status: 200,
+            body: {
+              ok: true,
+              message: `Snapshot version ${sourceVersion} restored and published.`,
+              target: 'published',
+              source_snapshot_version: sourceVersion,
+              previous_published_version: previousPublishedVersion,
+              version: nextVersion,
+              published_at: stamp,
+              schedule_counts: scheduleCounts,
+              affected_brands: recoveryImpact.affectedBrands,
+            },
+          };
+        });
+        res.status((result && result.status) || 500).json((result && result.body) || { ok: false, message: 'Catalog restore failed.' });
         return;
       }
       if (action === 'apply_user_operations') {

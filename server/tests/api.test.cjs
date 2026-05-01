@@ -4,8 +4,15 @@ const assert = require('node:assert/strict');
 const { newDb } = require('pg-mem');
 
 const { createApp } = require('../app.cjs');
-const { closePool } = require('../db.cjs');
+const { closePool, withDb, upsertUserRow, readDb } = require('../db.cjs');
 const { hashPassword } = require('../lib.cjs');
+const {
+  DESTRUCTIVE_PUBLISH_BLOCKED_CODE,
+  PUBLISH_BASE_VERSION_STALE_CODE,
+  SMOKE_PUBLISH_BLOCKED_CODE,
+  buildCatalogScheduleSummary,
+  buildRecoveryConfirmationToken,
+} = require('../catalog-publish-guard.cjs');
 
 async function listen(serverApp) {
   return await new Promise((resolve, reject) => {
@@ -200,6 +207,201 @@ async function signIn(harness, identifier = 'ADMIN1001', password = 'Admin123A',
   assert.equal(response.body.ok, true);
   assert.ok(harness.cookie, 'sign-in should set a session cookie');
   return response;
+}
+
+function deepClone(value) {
+  return JSON.parse(JSON.stringify(value));
+}
+
+function ensureBrand(payload, brandId, defaults = {}) {
+  if (!Array.isArray(payload.brands)) payload.brands = [];
+  let brand = payload.brands.find((entry) => String((entry && entry.id) || '').trim() === String(brandId || '').trim()) || null;
+  if (!brand) {
+    brand = {
+      id: brandId,
+      name: String(defaults.name || brandId),
+      active: true,
+      showScheduleDates: {},
+      showScheduleStatus: {},
+    };
+    payload.brands.push(brand);
+  }
+  return brand;
+}
+
+function setBrandSchedule(payload, brandId, scheduleDates, scheduleStatus = {}, defaults = {}) {
+  const brand = ensureBrand(payload, brandId, defaults);
+  brand.active = true;
+  brand.name = String(defaults.name || brand.name || brandId);
+  brand.showScheduleDates = deepClone(scheduleDates);
+  brand.showScheduleStatus = deepClone(scheduleStatus);
+  return brand;
+}
+
+function buildScheduledCatalogPayload(basePayload) {
+  const payload = deepClone(basePayload);
+  payload.meta = payload.meta && typeof payload.meta === 'object' ? payload.meta : {};
+  payload.ticketLines = Array.isArray(payload.ticketLines) ? payload.ticketLines : [];
+  payload.resources = Array.isArray(payload.resources) ? payload.resources : [];
+  payload.managerCategories = Array.isArray(payload.managerCategories) ? payload.managerCategories : [];
+  payload.managerEntries = Array.isArray(payload.managerEntries) ? payload.managerEntries : [];
+  payload.phoneDirectoryEntries = Array.isArray(payload.phoneDirectoryEntries) ? payload.phoneDirectoryEntries : [];
+  setBrandSchedule(
+    payload,
+    'brand-medieval-times',
+    {
+      '2026-06-01': ['7:00 PM', '9:00 PM'],
+      '2026-06-02': ['7:00 PM'],
+    },
+    {
+      '2026-06-01': { '9:00 PM': 'soldout' },
+    },
+    { name: 'Medieval Times' },
+  );
+  setBrandSchedule(
+    payload,
+    'brand-carolina-opry',
+    {
+      '2026-06-03': ['8:00 PM'],
+    },
+    {},
+    { name: 'Carolina Opry' },
+  );
+  return payload;
+}
+
+async function seedPublishedSnapshot(pool, payload, version, options = {}) {
+  const stamp = String(options.stamp || `2026-05-01T00:${String(version).padStart(2, '0')}:00.000Z`);
+  const userId = String(options.userId || 'user-admin-1');
+  const nextPayload = deepClone(payload);
+  nextPayload.meta = nextPayload.meta && typeof nextPayload.meta === 'object' ? nextPayload.meta : {};
+  nextPayload.meta.version = version;
+  nextPayload.meta.lastPublishedCatalogVersion = version;
+  nextPayload.meta.publishedAt = stamp;
+  nextPayload.meta.lastPublishedAt = stamp;
+  nextPayload.meta.updatedAt = stamp;
+  await withDb(pool, async (db) => {
+    if (!db.snapshots || typeof db.snapshots !== 'object') db.snapshots = {};
+    db.snapshots.published = {
+      version,
+      publishedAt: stamp,
+      updatedAt: stamp,
+      publishedByUserId: userId,
+      payload: deepClone(nextPayload),
+    };
+    const history = Array.isArray(db.snapshots.history) ? db.snapshots.history.filter((entry) => Number(entry.version) !== Number(version)) : [];
+    history.push({
+      version,
+      publishedAt: stamp,
+      updatedAt: stamp,
+      publishedByUserId: userId,
+      payload: deepClone(nextPayload),
+    });
+    history.sort((left, right) => Number(left.version || 0) - Number(right.version || 0));
+    db.snapshots.history = history;
+    db.snapshots.draft = {
+      updatedAt: stamp,
+      updatedByUserId: userId,
+      payload: deepClone(nextPayload),
+    };
+  });
+}
+
+async function latestPublishedSnapshot(harness) {
+  const published = await requestJson(harness, '/api/snapshots/published/latest');
+  assert.equal(published.status, 200, `published snapshot fetch failed: ${JSON.stringify(published.body)}`);
+  return published;
+}
+
+async function latestAuditByAction(pool, action) {
+  const state = await readDb(pool);
+  const rows = Array.isArray(state.audit) ? state.audit.filter((entry) => String(entry.action || '') === String(action || '')) : [];
+  return rows.length ? rows[rows.length - 1] : null;
+}
+
+async function addSmokePrimaryAdmin(pool, overrides = {}) {
+  const password = String(overrides.password || 'Smoke123A');
+  const stamp = String(overrides.stamp || '2026-05-01T00:00:00.000Z');
+  const wwid = String(overrides.wwid || 'SMOKE9001');
+  await upsertUserRow(pool, {
+    id: String(overrides.id || 'user-smoke-admin-only-1'),
+    displayName: String(overrides.displayName || 'Stage Smoke Admin Only 05137931'),
+    firstName: String(overrides.firstName || 'Stage'),
+    lastName: String(overrides.lastName || 'Smoke Admin Only 05137931'),
+    wwid,
+    email: String(overrides.email || 'smoke-admin@example.com'),
+    phone: '',
+    role: 'admin',
+    isAssistant: false,
+    canAccessMarketer: false,
+    canAccessAdmin: true,
+    canAccessManager: false,
+    managerTitle: '',
+    managerOnly: false,
+    departmentIds: [],
+    status: 'active',
+    isLocked: false,
+    passwordHash: hashPassword(password),
+    forcePasswordReset: false,
+    createdAt: stamp,
+    updatedAt: stamp,
+  });
+  return { identifier: wwid, password };
+}
+
+async function addAssistantAdmin(pool, overrides = {}) {
+  const password = String(overrides.password || 'Assist123A');
+  const stamp = String(overrides.stamp || '2026-05-01T00:00:00.000Z');
+  const wwid = String(overrides.wwid || 'ADMIN2001');
+  await upsertUserRow(pool, {
+    id: String(overrides.id || 'user-admin-2'),
+    displayName: String(overrides.displayName || 'Assistant Admin'),
+    firstName: String(overrides.firstName || 'Assistant'),
+    lastName: String(overrides.lastName || 'Admin'),
+    wwid,
+    email: String(overrides.email || 'assistant-admin@example.com'),
+    phone: '',
+    role: 'admin',
+    isAssistant: true,
+    canAccessMarketer: true,
+    canAccessAdmin: true,
+    canAccessManager: true,
+    managerTitle: '',
+    managerOnly: false,
+    departmentIds: [],
+    status: 'active',
+    isLocked: false,
+    passwordHash: hashPassword(password),
+    forcePasswordReset: false,
+    createdAt: stamp,
+    updatedAt: stamp,
+  });
+  return { identifier: wwid, password };
+}
+
+async function withEnv(overrides, callback) {
+  const keys = Object.keys(overrides || {});
+  const previous = new Map();
+  keys.forEach((key) => {
+    previous.set(key, Object.prototype.hasOwnProperty.call(process.env, key) ? process.env[key] : undefined);
+    const nextValue = overrides[key];
+    if (nextValue === undefined || nextValue === null) {
+      delete process.env[key];
+      return;
+    }
+    process.env[key] = String(nextValue);
+  });
+  try {
+    return await callback();
+  } finally {
+    keys.forEach((key) => {
+      if (previous.get(key) === undefined) {
+        delete process.env[key];
+        return;
+      }
+      process.env[key] = previous.get(key);
+    });
+  }
 }
 
 test('cloud save_and_sync_status returns unknown for an unrecorded request id', async () => {
@@ -664,4 +866,336 @@ test('cloud health_check and auth_lookup still behave unchanged with save_and_sy
   } finally {
     await teardownHarness(harness);
   }
+});
+
+test('cloud save_and_sync allows publish when existing schedules are preserved', async () => {
+  const harness = await setupHarness();
+  try {
+    await signIn(harness);
+    const initial = await latestPublishedSnapshot(harness);
+    const scheduledPayload = buildScheduledCatalogPayload(initial.body.snapshot);
+    await seedPublishedSnapshot(harness.db, scheduledPayload, 2);
+
+    const current = await latestPublishedSnapshot(harness);
+    const beforeCounts = buildCatalogScheduleSummary(current.body.snapshot).counts;
+    const saveSend = await requestJson(harness, '/api/cloud', {
+      method: 'POST',
+      body: {
+        action: 'save_and_sync',
+        request_id: 'preserve-schedules-publish',
+        payload: deepClone(current.body.snapshot),
+      },
+    });
+
+    assert.equal(saveSend.status, 200, `Schedule-preserving publish should pass: ${JSON.stringify(saveSend.body)}`);
+    assert.equal(saveSend.body.ok, true);
+    assert.equal(saveSend.body.status, 'confirmed_success');
+
+    const afterPublished = await latestPublishedSnapshot(harness);
+    assert.equal(Number(afterPublished.body.metadata && afterPublished.body.metadata.version), 3);
+    assert.deepEqual(buildCatalogScheduleSummary(afterPublished.body.snapshot).counts, beforeCounts);
+  } finally {
+    await teardownHarness(harness);
+  }
+});
+
+test('cloud save_and_sync allows unrelated brand edits without schedule loss', async () => {
+  const harness = await setupHarness();
+  try {
+    await signIn(harness);
+    const initial = await latestPublishedSnapshot(harness);
+    const scheduledPayload = buildScheduledCatalogPayload(initial.body.snapshot);
+    await seedPublishedSnapshot(harness.db, scheduledPayload, 2);
+
+    const current = await latestPublishedSnapshot(harness);
+    const payload = deepClone(current.body.snapshot);
+    const medieval = ensureBrand(payload, 'brand-medieval-times', { name: 'Medieval Times' });
+    medieval.marketerSearchLabel = 'Medieval Times Search Updated';
+    const beforeCounts = buildCatalogScheduleSummary(current.body.snapshot).counts;
+
+    const saveSend = await requestJson(harness, '/api/cloud', {
+      method: 'POST',
+      body: {
+        action: 'save_and_sync',
+        request_id: 'unrelated-brand-edit-publish',
+        payload,
+      },
+    });
+
+    assert.equal(saveSend.status, 200, `Unrelated brand edit should publish: ${JSON.stringify(saveSend.body)}`);
+    assert.equal(saveSend.body.ok, true);
+
+    const afterPublished = await latestPublishedSnapshot(harness);
+    const updatedBrand = (afterPublished.body.snapshot.brands || []).find((entry) => String((entry && entry.id) || '') === 'brand-medieval-times');
+    assert.ok(updatedBrand, 'Expected Medieval Times in published payload');
+    assert.equal(updatedBrand.marketerSearchLabel, 'Medieval Times Search Updated');
+    assert.deepEqual(buildCatalogScheduleSummary(afterPublished.body.snapshot).counts, beforeCounts);
+  } finally {
+    await teardownHarness(harness);
+  }
+});
+
+test('cloud save_and_sync allows additive schedule updates', async () => {
+  const harness = await setupHarness();
+  try {
+    await signIn(harness);
+    const initial = await latestPublishedSnapshot(harness);
+    const scheduledPayload = buildScheduledCatalogPayload(initial.body.snapshot);
+    await seedPublishedSnapshot(harness.db, scheduledPayload, 2);
+
+    const current = await latestPublishedSnapshot(harness);
+    const payload = deepClone(current.body.snapshot);
+    const medieval = ensureBrand(payload, 'brand-medieval-times', { name: 'Medieval Times' });
+    medieval.showScheduleDates['2026-06-02'].push('9:30 PM');
+    const beforeCounts = buildCatalogScheduleSummary(current.body.snapshot).counts;
+
+    const saveSend = await requestJson(harness, '/api/cloud', {
+      method: 'POST',
+      body: {
+        action: 'save_and_sync',
+        request_id: 'add-schedule-time-publish',
+        payload,
+      },
+    });
+
+    assert.equal(saveSend.status, 200, `Additive schedule publish should pass: ${JSON.stringify(saveSend.body)}`);
+    assert.equal(saveSend.body.ok, true);
+
+    const afterPublished = await latestPublishedSnapshot(harness);
+    const afterCounts = buildCatalogScheduleSummary(afterPublished.body.snapshot).counts;
+    assert.equal(afterCounts.totalScheduleSlots, beforeCounts.totalScheduleSlots + 1);
+    assert.equal(afterCounts.scheduledBrandCount, beforeCounts.scheduledBrandCount);
+  } finally {
+    await teardownHarness(harness);
+  }
+});
+
+test('cloud save_and_sync blocks destructive schedule loss and leaves published and draft unchanged', async () => {
+  const harness = await setupHarness();
+  try {
+    await signIn(harness);
+    const initial = await latestPublishedSnapshot(harness);
+    const scheduledPayload = buildScheduledCatalogPayload(initial.body.snapshot);
+    await seedPublishedSnapshot(harness.db, scheduledPayload, 2);
+
+    const current = await latestPublishedSnapshot(harness);
+    const payload = deepClone(current.body.snapshot);
+    const medieval = ensureBrand(payload, 'brand-medieval-times', { name: 'Medieval Times' });
+    medieval.showScheduleDates = {};
+    medieval.showScheduleStatus = {};
+    const beforeState = await readDb(harness.db);
+
+    const saveSend = await requestJson(harness, '/api/cloud', {
+      method: 'POST',
+      body: {
+        action: 'save_and_sync',
+        request_id: 'destructive-schedule-loss',
+        payload,
+      },
+    });
+
+    assert.equal(saveSend.status, 409, `Destructive publish should be blocked: ${JSON.stringify(saveSend.body)}`);
+    assert.equal(saveSend.body.ok, false);
+    assert.equal(saveSend.body.code, DESTRUCTIVE_PUBLISH_BLOCKED_CODE);
+    assert.equal(saveSend.body.message, 'Publish blocked because it would remove existing show dates/times. Use explicit restore mode if this is intentional disaster recovery.');
+    assert.ok(
+      Array.isArray(saveSend.body.affected_brands) &&
+        saveSend.body.affected_brands.some((entry) => String(entry.id || '') === 'brand-medieval-times'),
+      `Expected Medieval Times in affected brands: ${JSON.stringify(saveSend.body.affected_brands)}`,
+    );
+
+    const afterPublished = await latestPublishedSnapshot(harness);
+    assert.equal(Number(afterPublished.body.metadata && afterPublished.body.metadata.version), 2);
+    assert.deepEqual(afterPublished.body.snapshot, beforeState.snapshots.published.payload);
+
+    const afterState = await readDb(harness.db);
+    assert.deepEqual(afterState.snapshots.draft.payload, beforeState.snapshots.draft.payload);
+
+    const audit = await latestAuditByAction(harness.db, 'catalog.save_and_send_failed');
+    assert.ok(audit, 'Expected blocked destructive publish audit entry');
+    assert.equal(String((audit.details && audit.details.code) || ''), DESTRUCTIVE_PUBLISH_BLOCKED_CODE);
+    assert.ok(
+      Array.isArray(audit.details && audit.details.affectedBrands) &&
+        audit.details.affectedBrands.some((entry) => String(entry.id || '') === 'brand-medieval-times'),
+      `Expected destructive audit details for Medieval Times: ${JSON.stringify(audit && audit.details)}`,
+    );
+  } finally {
+    await teardownHarness(harness);
+  }
+});
+
+test('cloud save_and_sync blocks stale 73-brand seed/default payload before publish', async () => {
+  const harness = await setupHarness();
+  try {
+    await signIn(harness);
+    const initial = await latestPublishedSnapshot(harness);
+    const staleSeedPayload = deepClone(initial.body.snapshot);
+    staleSeedPayload.brands = Array.from({ length: 73 }, (_, index) => ({
+      id: `brand-seed-${index + 1}`,
+      name: `Seed Brand ${index + 1}`,
+      active: true,
+      showScheduleDates: {},
+      showScheduleStatus: {},
+    }));
+    const scheduledPayload = buildScheduledCatalogPayload(initial.body.snapshot);
+    await seedPublishedSnapshot(harness.db, scheduledPayload, 2);
+    const beforeState = await readDb(harness.db);
+
+    const saveSend = await requestJson(harness, '/api/cloud', {
+      method: 'POST',
+      body: {
+        action: 'save_and_sync',
+        request_id: 'stale-seed-default-publish',
+        payload: staleSeedPayload,
+      },
+    });
+
+    assert.equal(saveSend.status, 409, `Stale seed payload should be blocked: ${JSON.stringify(saveSend.body)}`);
+    assert.equal(saveSend.body.ok, false);
+    assert.equal(saveSend.body.code, PUBLISH_BASE_VERSION_STALE_CODE);
+    assert.equal(saveSend.body.current_published_version, 2);
+    assert.equal(saveSend.body.base_snapshot_version, 1);
+
+    const afterPublished = await latestPublishedSnapshot(harness);
+    assert.equal(Number(afterPublished.body.metadata && afterPublished.body.metadata.version), 2);
+    assert.deepEqual(afterPublished.body.snapshot, beforeState.snapshots.published.payload);
+
+    const afterState = await readDb(harness.db);
+    assert.deepEqual(afterState.snapshots.draft.payload, beforeState.snapshots.draft.payload);
+
+    const audit = await latestAuditByAction(harness.db, 'catalog.save_and_send_failed');
+    assert.ok(audit, 'Expected stale publish rejection audit entry');
+    assert.equal(String((audit.details && audit.details.code) || ''), PUBLISH_BASE_VERSION_STALE_CODE);
+    assert.equal(Number((audit.details && audit.details.currentVersion) || 0), 2);
+    assert.equal(Number((audit.details && audit.details.baseVersion) || 0), 1);
+  } finally {
+    await teardownHarness(harness);
+  }
+});
+
+test('catalog restore snapshot requires explicit confirmation and supports draft preview then published restore', async () => {
+  const harness = await setupHarness();
+  try {
+    await signIn(harness);
+    const initialState = await readDb(harness.db);
+    const initialPublishedPayload = deepClone(initialState.snapshots.published.payload);
+    const normalizedInitialPublishedPayload = Object.assign({}, initialPublishedPayload, {
+      phoneDirectoryEntries: Array.isArray(initialPublishedPayload.phoneDirectoryEntries)
+        ? deepClone(initialPublishedPayload.phoneDirectoryEntries)
+        : [],
+    });
+    const initial = await latestPublishedSnapshot(harness);
+    const scheduledPayload = buildScheduledCatalogPayload(initial.body.snapshot);
+    await seedPublishedSnapshot(harness.db, scheduledPayload, 2);
+
+    const missingConfirmation = await requestJson(harness, '/api/cloud', {
+      method: 'POST',
+      body: {
+        action: 'catalog_restore_snapshot',
+        source_snapshot_version: 1,
+        recovery_target: 'draft',
+      },
+    });
+    assert.equal(missingConfirmation.status, 400, `Missing recovery confirmation should fail: ${JSON.stringify(missingConfirmation.body)}`);
+    assert.equal(missingConfirmation.body.ok, false);
+    assert.equal(missingConfirmation.body.code, 'RECOVERY_CONFIRMATION_REQUIRED');
+
+    const draftPreview = await requestJson(harness, '/api/cloud', {
+      method: 'POST',
+      body: {
+        action: 'catalog_restore_snapshot',
+        source_snapshot_version: 1,
+        recovery_target: 'draft',
+        confirmation_token: buildRecoveryConfirmationToken(1, 'draft'),
+      },
+    });
+    assert.equal(draftPreview.status, 200, `Draft recovery preview should pass: ${JSON.stringify(draftPreview.body)}`);
+    assert.equal(draftPreview.body.ok, true);
+    assert.equal(draftPreview.body.target, 'draft');
+
+    const afterDraftPreview = await readDb(harness.db);
+    assert.equal(afterDraftPreview.snapshots.published.version, 2);
+    assert.deepEqual(afterDraftPreview.snapshots.draft.payload, normalizedInitialPublishedPayload);
+
+    const publishRestore = await requestJson(harness, '/api/cloud', {
+      method: 'POST',
+      body: {
+        action: 'catalog_restore_snapshot',
+        source_snapshot_version: 1,
+        recovery_target: 'published',
+        confirmation_token: buildRecoveryConfirmationToken(1, 'published'),
+      },
+    });
+    assert.equal(publishRestore.status, 200, `Published recovery restore should pass: ${JSON.stringify(publishRestore.body)}`);
+    assert.equal(publishRestore.body.ok, true);
+    assert.equal(publishRestore.body.target, 'published');
+    assert.equal(publishRestore.body.source_snapshot_version, 1);
+
+    const afterPublished = await latestPublishedSnapshot(harness);
+    assert.equal(Number(afterPublished.body.metadata && afterPublished.body.metadata.version), 3);
+    assert.deepEqual(
+      afterPublished.body.snapshot,
+      Object.assign({}, normalizedInitialPublishedPayload, {
+        meta: Object.assign({}, normalizedInitialPublishedPayload.meta || {}, {
+          version: 3,
+          publishedAt: afterPublished.body.metadata.publishedAt,
+          updatedAt: afterPublished.body.metadata.updatedAt,
+        }),
+      }),
+    );
+
+    const restoreAudit = await latestAuditByAction(harness.db, 'catalog.restore_snapshot_publish');
+    assert.ok(restoreAudit, 'Expected restore publish audit entry');
+    assert.equal(Number((restoreAudit.details && restoreAudit.details.sourceVersion) || 0), 1);
+  } finally {
+    await teardownHarness(harness);
+  }
+});
+
+test('catalog restore snapshot is limited to primary admin accounts', async () => {
+  const harness = await setupHarness();
+  try {
+    const assistant = await addAssistantAdmin(harness.db);
+    await signIn(harness, assistant.identifier, assistant.password, 'admin');
+    const restore = await requestJson(harness, '/api/cloud', {
+      method: 'POST',
+      body: {
+        action: 'catalog_restore_snapshot',
+        source_snapshot_version: 1,
+        recovery_target: 'draft',
+        confirmation_token: buildRecoveryConfirmationToken(1, 'draft'),
+      },
+    });
+    assert.equal(restore.status, 403, `assistant admin should be blocked from recovery mode: ${JSON.stringify(restore.body)}`);
+    assert.equal(restore.body.ok, false);
+    assert.equal(restore.body.code, 'PRIMARY_ADMIN_REQUIRED');
+  } finally {
+    await teardownHarness(harness);
+  }
+});
+
+test('smoke admin publish is blocked on production-like runtime unless explicitly enabled', async () => {
+  await withEnv({ NODE_ENV: 'production' }, async () => {
+    const harness = await setupHarness();
+    try {
+      const smokeUser = await addSmokePrimaryAdmin(harness.db);
+      await signIn(harness, smokeUser.identifier, smokeUser.password, 'admin');
+      const published = await latestPublishedSnapshot(harness);
+
+      const saveSend = await requestJson(harness, '/api/cloud', {
+        method: 'POST',
+        body: {
+          action: 'save_and_sync',
+          request_id: 'smoke-admin-publish-blocked',
+          payload: published.body.snapshot,
+        },
+      });
+
+      assert.equal(saveSend.status, 403, `Smoke admin publish should be blocked: ${JSON.stringify(saveSend.body)}`);
+      assert.equal(saveSend.body.ok, false);
+      assert.equal(saveSend.body.code, SMOKE_PUBLISH_BLOCKED_CODE);
+    } finally {
+      await teardownHarness(harness);
+    }
+  });
 });
