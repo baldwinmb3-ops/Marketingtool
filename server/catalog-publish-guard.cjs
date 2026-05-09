@@ -1,6 +1,7 @@
 const { toInt, normalizeRole, normalizeStatus } = require('./lib.cjs');
 
 const DATE_KEY_RE = /^\d{4}-\d{2}-\d{2}$/;
+const WEEKDAY_KEY_RE = /^[0-6]$/;
 const SMOKE_PUBLISH_OVERRIDE_ENV = 'APP_ALLOW_SMOKE_PUBLISH';
 
 const DESTRUCTIVE_PUBLISH_BLOCKED_CODE = 'DESTRUCTIVE_PUBLISH_BLOCKED';
@@ -26,6 +27,11 @@ function normalizeDateKey(value) {
 
 function normalizeTimeKey(value) {
   return String(value || '').trim().slice(0, 40);
+}
+
+function normalizeWeekdayKey(value) {
+  const dayKey = String(value || '').trim();
+  return WEEKDAY_KEY_RE.test(dayKey) ? dayKey : '';
 }
 
 function normalizeStatusValue(value) {
@@ -67,6 +73,18 @@ function normalizeScheduleStatus(raw) {
   return out;
 }
 
+function normalizeScheduleWeekly(raw) {
+  const src = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {};
+  const out = {};
+  for (const [rawDayKey, rawTimes] of Object.entries(src)) {
+    const dayKey = normalizeWeekdayKey(rawDayKey);
+    if (!dayKey) continue;
+    const cleanTimes = uniqueSortedStrings((Array.isArray(rawTimes) ? rawTimes : []).map(normalizeTimeKey));
+    if (cleanTimes.length) out[dayKey] = cleanTimes;
+  }
+  return out;
+}
+
 function buildBrandScheduleState(brand) {
   const row = brand && typeof brand === 'object' ? brand : {};
   const id = String(row.id || '').trim();
@@ -75,8 +93,10 @@ function buildBrandScheduleState(brand) {
   const active = row.active !== false;
   const scheduleDates = normalizeScheduleDates(row.showScheduleDates);
   const scheduleStatus = normalizeScheduleStatus(row.showScheduleStatus);
+  const scheduleWeekly = normalizeScheduleWeekly(row.showScheduleWeekly);
   const scheduleSlotKeys = [];
   const statusEntryKeys = [];
+  const weeklySlotKeys = [];
 
   for (const [dateKey, times] of Object.entries(scheduleDates)) {
     for (const timeKey of times) {
@@ -88,6 +108,11 @@ function buildBrandScheduleState(brand) {
       statusEntryKeys.push(`${dateKey}|${timeKey}`);
     }
   }
+  for (const [dayKey, times] of Object.entries(scheduleWeekly)) {
+    for (const timeKey of times) {
+      weeklySlotKeys.push(`${dayKey}|${timeKey}`);
+    }
+  }
 
   return {
     id,
@@ -95,8 +120,10 @@ function buildBrandScheduleState(brand) {
     active,
     scheduleSlotKeys: uniqueSortedStrings(scheduleSlotKeys),
     statusEntryKeys: uniqueSortedStrings(statusEntryKeys),
+    weeklySlotKeys: uniqueSortedStrings(weeklySlotKeys),
     scheduleSlotCount: scheduleSlotKeys.length,
     statusEntryCount: statusEntryKeys.length,
+    weeklySlotCount: weeklySlotKeys.length,
   };
 }
 
@@ -105,8 +132,10 @@ function buildCatalogScheduleSummary(payload) {
   const byId = new Map();
   let totalScheduleSlots = 0;
   let totalStatusEntries = 0;
+  let totalWeeklySlots = 0;
   let scheduledBrandCount = 0;
   let statusBrandCount = 0;
+  let weeklyBrandCount = 0;
   let activeScheduledBrandCount = 0;
 
   for (const brand of brands) {
@@ -115,19 +144,23 @@ function buildCatalogScheduleSummary(payload) {
     byId.set(state.id, state);
     totalScheduleSlots += state.scheduleSlotCount;
     totalStatusEntries += state.statusEntryCount;
+    totalWeeklySlots += state.weeklySlotCount;
     if (state.scheduleSlotCount > 0) {
       scheduledBrandCount += 1;
       if (state.active) activeScheduledBrandCount += 1;
     }
     if (state.statusEntryCount > 0) statusBrandCount += 1;
+    if (state.weeklySlotCount > 0) weeklyBrandCount += 1;
   }
 
   return {
     counts: {
       totalScheduleSlots,
       totalStatusEntries,
+      totalWeeklySlots,
       scheduledBrandCount,
       statusBrandCount,
+      weeklyBrandCount,
       activeScheduledBrandCount,
     },
     byId,
@@ -145,8 +178,10 @@ function summarizeScheduleCounts(summary) {
   return {
     totalScheduledSlots: Number(counts.totalScheduleSlots) || 0,
     totalStatusEntries: Number(counts.totalStatusEntries) || 0,
+    totalWeeklySlots: Number(counts.totalWeeklySlots) || 0,
     scheduledBrandCount: Number(counts.scheduledBrandCount) || 0,
     statusBrandCount: Number(counts.statusBrandCount) || 0,
+    weeklyBrandCount: Number(counts.weeklyBrandCount) || 0,
     activeScheduledBrandCount: Number(counts.activeScheduledBrandCount) || 0,
   };
 }
@@ -158,7 +193,7 @@ function diffCatalogScheduleImpact(currentPayload, incomingPayload) {
 
   for (const currentBrand of beforeSummary.brands) {
     if (!currentBrand.active) continue;
-    if (!(currentBrand.scheduleSlotCount > 0 || currentBrand.statusEntryCount > 0)) continue;
+    if (!(currentBrand.scheduleSlotCount > 0 || currentBrand.weeklySlotCount > 0)) continue;
     const nextBrand = afterSummary.byId.get(currentBrand.id) || null;
     const removedScheduleSlotKeys =
       !nextBrand || !nextBrand.active
@@ -168,8 +203,14 @@ function diffCatalogScheduleImpact(currentPayload, incomingPayload) {
       !nextBrand || !nextBrand.active
         ? currentBrand.statusEntryKeys.slice()
         : subtractKeys(currentBrand.statusEntryKeys, nextBrand.statusEntryKeys);
+    const removedWeeklySlotKeys =
+      !nextBrand || !nextBrand.active
+        ? currentBrand.weeklySlotKeys.slice()
+        : subtractKeys(currentBrand.weeklySlotKeys, nextBrand.weeklySlotKeys);
 
-    if (!removedScheduleSlotKeys.length && !removedStatusEntryKeys.length) continue;
+    // Status-only removals can legitimately revert a live slot back to available.
+    // Only real dated-slot loss or weekly-template loss should trip the destructive guard.
+    if (!removedScheduleSlotKeys.length && !removedWeeklySlotKeys.length) continue;
 
     affectedBrands.push({
       id: currentBrand.id,
@@ -181,10 +222,14 @@ function diffCatalogScheduleImpact(currentPayload, incomingPayload) {
       afterScheduleSlotCount: nextBrand ? nextBrand.scheduleSlotCount : 0,
       beforeStatusEntryCount: currentBrand.statusEntryCount,
       afterStatusEntryCount: nextBrand ? nextBrand.statusEntryCount : 0,
+      beforeWeeklySlotCount: currentBrand.weeklySlotCount,
+      afterWeeklySlotCount: nextBrand ? nextBrand.weeklySlotCount : 0,
       removedScheduleSlotCount: removedScheduleSlotKeys.length,
       removedStatusEntryCount: removedStatusEntryKeys.length,
+      removedWeeklySlotCount: removedWeeklySlotKeys.length,
       removedScheduleSlotsSample: removedScheduleSlotKeys.slice(0, 25),
       removedStatusEntriesSample: removedStatusEntryKeys.slice(0, 25),
+      removedWeeklySlotsSample: removedWeeklySlotKeys.slice(0, 25),
     });
   }
 
@@ -312,6 +357,7 @@ module.exports = {
   SMOKE_PUBLISH_OVERRIDE_ENV,
   normalizeScheduleDates,
   normalizeScheduleStatus,
+  normalizeScheduleWeekly,
   buildCatalogScheduleSummary,
   diffCatalogScheduleImpact,
   extractCatalogBaseVersion,

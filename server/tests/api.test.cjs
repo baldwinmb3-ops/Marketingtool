@@ -970,6 +970,220 @@ test('cloud save_and_sync allows additive schedule updates', async () => {
   }
 });
 
+test('cloud save_and_sync allows status-only removal when the dated slot is preserved', async () => {
+  const harness = await setupHarness();
+  try {
+    await signIn(harness);
+    const initial = await latestPublishedSnapshot(harness);
+    const scheduledPayload = buildScheduledCatalogPayload(initial.body.snapshot);
+    const medievalSeed = ensureBrand(scheduledPayload, 'brand-medieval-times', { name: 'Medieval Times' });
+    medievalSeed.showScheduleWeekly = {
+      '1': ['7:00 PM', '9:00 PM'],
+      '2': ['7:00 PM'],
+    };
+    medievalSeed.showScheduleStatus = {
+      '2026-06-01': { '7:00 PM': 'limited', '9:00 PM': 'soldout' },
+    };
+    await seedPublishedSnapshot(harness.db, scheduledPayload, 2);
+
+    const current = await latestPublishedSnapshot(harness);
+    const payload = deepClone(current.body.snapshot);
+    const medieval = ensureBrand(payload, 'brand-medieval-times', { name: 'Medieval Times' });
+    const liveMedieval = ensureBrand(current.body.snapshot, 'brand-medieval-times', { name: 'Medieval Times' });
+    medieval.showScheduleStatus = {
+      '2026-06-01': { '9:00 PM': 'soldout' },
+    };
+    const beforeCounts = buildCatalogScheduleSummary(current.body.snapshot).counts;
+
+    const saveSend = await requestJson(harness, '/api/cloud', {
+      method: 'POST',
+      body: {
+        action: 'save_and_sync',
+        request_id: 'status-only-clear-preserved-slot',
+        payload,
+      },
+    });
+
+    assert.equal(saveSend.status, 200, `Status-only removal should publish: ${JSON.stringify(saveSend.body)}`);
+    assert.equal(saveSend.body.ok, true);
+    assert.equal(saveSend.body.status, 'confirmed_success');
+
+    const afterPublished = await latestPublishedSnapshot(harness);
+    const afterMedieval = ensureBrand(afterPublished.body.snapshot, 'brand-medieval-times', { name: 'Medieval Times' });
+    const afterCounts = buildCatalogScheduleSummary(afterPublished.body.snapshot).counts;
+    assert.deepEqual(afterMedieval.showScheduleDates, liveMedieval.showScheduleDates, 'Status-only publish must preserve the live showScheduleDates.');
+    assert.deepEqual(afterMedieval.showScheduleWeekly || {}, liveMedieval.showScheduleWeekly || {}, 'Status-only publish must preserve the live showScheduleWeekly.');
+    assert.deepEqual(
+      afterMedieval.showScheduleStatus || {},
+      { '2026-06-01': { '9:00 PM': 'soldout' } },
+      'Status-only publish must remove only the intended status override.',
+    );
+    assert.equal(afterCounts.totalScheduleSlots, beforeCounts.totalScheduleSlots, 'Status-only publish must preserve total schedule slot count.');
+    assert.equal(afterCounts.scheduledBrandCount, beforeCounts.scheduledBrandCount, 'Status-only publish must preserve scheduled brand count.');
+    assert.equal(afterCounts.totalStatusEntries, beforeCounts.totalStatusEntries - 1, 'Status-only publish should remove only the intended status entry.');
+    assert.equal(afterCounts.totalWeeklySlots, beforeCounts.totalWeeklySlots, 'Status-only publish must preserve weekly schedule slot count.');
+  } finally {
+    await teardownHarness(harness);
+  }
+});
+
+test('cloud save_and_sync blocks removing a whole live show date and its slot status', async () => {
+  const harness = await setupHarness();
+  try {
+    await signIn(harness);
+    const initial = await latestPublishedSnapshot(harness);
+    const scheduledPayload = buildScheduledCatalogPayload(initial.body.snapshot);
+    const medievalSeed = ensureBrand(scheduledPayload, 'brand-medieval-times', { name: 'Medieval Times' });
+    medievalSeed.showScheduleWeekly = {
+      '1': ['7:00 PM', '9:00 PM'],
+      '2': ['7:00 PM'],
+    };
+    medievalSeed.showScheduleStatus = {
+      '2026-06-01': { '9:00 PM': 'soldout' },
+      '2026-06-02': { '7:00 PM': 'limited' },
+    };
+    await seedPublishedSnapshot(harness.db, scheduledPayload, 2);
+    const beforeState = await readDb(harness.db);
+
+    const current = await latestPublishedSnapshot(harness);
+    const payload = deepClone(current.body.snapshot);
+    const medieval = ensureBrand(payload, 'brand-medieval-times', { name: 'Medieval Times' });
+    delete medieval.showScheduleDates['2026-06-02'];
+    delete medieval.showScheduleStatus['2026-06-02'];
+
+    const saveSend = await requestJson(harness, '/api/cloud', {
+      method: 'POST',
+      body: {
+        action: 'save_and_sync',
+        request_id: 'remove-live-show-date-and-status',
+        payload,
+      },
+    });
+
+    assert.equal(saveSend.status, 409, `Whole-date removal should be blocked: ${JSON.stringify(saveSend.body)}`);
+    assert.equal(saveSend.body.ok, false);
+    assert.equal(saveSend.body.code, DESTRUCTIVE_PUBLISH_BLOCKED_CODE);
+    const affected = Array.isArray(saveSend.body.affected_brands) ? saveSend.body.affected_brands : [];
+    const medievalImpact = affected.find((entry) => String(entry.id || '') === 'brand-medieval-times');
+    assert.ok(medievalImpact, `Expected Medieval Times in affected brands: ${JSON.stringify(affected)}`);
+    assert.equal(Number(medievalImpact.removedScheduleSlotCount || 0) >= 1, true, `Expected removed dated slot count: ${JSON.stringify(medievalImpact)}`);
+    assert.equal(Number(medievalImpact.removedStatusEntryCount || 0) >= 1, true, `Expected removed status count: ${JSON.stringify(medievalImpact)}`);
+    assert.ok(
+      Array.isArray(medievalImpact.removedScheduleSlotsSample) && medievalImpact.removedScheduleSlotsSample.includes('2026-06-02|7:00 PM'),
+      `Expected removed dated slot sample for 2026-06-02 7:00 PM: ${JSON.stringify(medievalImpact)}`,
+    );
+
+    const afterPublished = await latestPublishedSnapshot(harness);
+    assert.equal(Number(afterPublished.body.metadata && afterPublished.body.metadata.version), 2);
+    assert.deepEqual(afterPublished.body.snapshot, beforeState.snapshots.published.payload);
+
+    const afterState = await readDb(harness.db);
+    assert.deepEqual(afterState.snapshots.draft.payload, beforeState.snapshots.draft.payload);
+  } finally {
+    await teardownHarness(harness);
+  }
+});
+
+test('cloud save_and_sync blocks removing weekly schedule templates even when dated slots remain', async () => {
+  const harness = await setupHarness();
+  try {
+    await signIn(harness);
+    const initial = await latestPublishedSnapshot(harness);
+    const scheduledPayload = buildScheduledCatalogPayload(initial.body.snapshot);
+    const medievalSeed = ensureBrand(scheduledPayload, 'brand-medieval-times', { name: 'Medieval Times' });
+    medievalSeed.showScheduleWeekly = {
+      '1': ['7:00 PM', '9:00 PM'],
+      '2': ['7:00 PM'],
+    };
+    await seedPublishedSnapshot(harness.db, scheduledPayload, 2);
+    const beforeState = await readDb(harness.db);
+
+    const current = await latestPublishedSnapshot(harness);
+    const payload = deepClone(current.body.snapshot);
+    const medieval = ensureBrand(payload, 'brand-medieval-times', { name: 'Medieval Times' });
+    medieval.showScheduleWeekly = {
+      '1': ['7:00 PM', '9:00 PM'],
+    };
+
+    const saveSend = await requestJson(harness, '/api/cloud', {
+      method: 'POST',
+      body: {
+        action: 'save_and_sync',
+        request_id: 'remove-weekly-template-only',
+        payload,
+      },
+    });
+
+    assert.equal(saveSend.status, 409, `Weekly schedule removal should be blocked: ${JSON.stringify(saveSend.body)}`);
+    assert.equal(saveSend.body.ok, false);
+    assert.equal(saveSend.body.code, DESTRUCTIVE_PUBLISH_BLOCKED_CODE);
+    const affected = Array.isArray(saveSend.body.affected_brands) ? saveSend.body.affected_brands : [];
+    const medievalImpact = affected.find((entry) => String(entry.id || '') === 'brand-medieval-times');
+    assert.ok(medievalImpact, `Expected Medieval Times in affected brands: ${JSON.stringify(affected)}`);
+    assert.equal(Number(medievalImpact.removedScheduleSlotCount || 0), 0, `Weekly-only removal should not report removed dated slots: ${JSON.stringify(medievalImpact)}`);
+    assert.equal(Number(medievalImpact.removedWeeklySlotCount || 0) >= 1, true, `Expected removed weekly slot count: ${JSON.stringify(medievalImpact)}`);
+    assert.ok(
+      Array.isArray(medievalImpact.removedWeeklySlotsSample) && medievalImpact.removedWeeklySlotsSample.includes('2|7:00 PM'),
+      `Expected removed weekly slot sample for weekday 2 at 7:00 PM: ${JSON.stringify(medievalImpact)}`,
+    );
+
+    const afterPublished = await latestPublishedSnapshot(harness);
+    assert.equal(Number(afterPublished.body.metadata && afterPublished.body.metadata.version), 2);
+    assert.deepEqual(afterPublished.body.snapshot, beforeState.snapshots.published.payload);
+
+    const afterState = await readDb(harness.db);
+    assert.deepEqual(afterState.snapshots.draft.payload, beforeState.snapshots.draft.payload);
+  } finally {
+    await teardownHarness(harness);
+  }
+});
+
+test('cloud save_and_sync blocks destructive schedule loss on an unrelated scheduled brand in the same payload', async () => {
+  const harness = await setupHarness();
+  try {
+    await signIn(harness);
+    const initial = await latestPublishedSnapshot(harness);
+    const scheduledPayload = buildScheduledCatalogPayload(initial.body.snapshot);
+    await seedPublishedSnapshot(harness.db, scheduledPayload, 2);
+    const beforeState = await readDb(harness.db);
+
+    const current = await latestPublishedSnapshot(harness);
+    const payload = deepClone(current.body.snapshot);
+    const carolina = ensureBrand(payload, 'brand-carolina-opry', { name: 'Carolina Opry' });
+    const medieval = ensureBrand(payload, 'brand-medieval-times', { name: 'Medieval Times' });
+    medieval.marketerSearchLabel = 'Medieval Times Search Updated';
+    carolina.showScheduleDates = {};
+    carolina.showScheduleStatus = {};
+
+    const saveSend = await requestJson(harness, '/api/cloud', {
+      method: 'POST',
+      body: {
+        action: 'save_and_sync',
+        request_id: 'unrelated-brand-destructive-loss',
+        payload,
+      },
+    });
+
+    assert.equal(saveSend.status, 409, `Unrelated destructive brand loss should be blocked: ${JSON.stringify(saveSend.body)}`);
+    assert.equal(saveSend.body.ok, false);
+    assert.equal(saveSend.body.code, DESTRUCTIVE_PUBLISH_BLOCKED_CODE);
+    assert.ok(
+      Array.isArray(saveSend.body.affected_brands) &&
+        saveSend.body.affected_brands.some((entry) => String(entry.id || '') === 'brand-carolina-opry'),
+      `Expected Carolina Opry in affected brands: ${JSON.stringify(saveSend.body.affected_brands)}`,
+    );
+
+    const afterPublished = await latestPublishedSnapshot(harness);
+    assert.equal(Number(afterPublished.body.metadata && afterPublished.body.metadata.version), 2);
+    assert.deepEqual(afterPublished.body.snapshot, beforeState.snapshots.published.payload);
+
+    const afterState = await readDb(harness.db);
+    assert.deepEqual(afterState.snapshots.draft.payload, beforeState.snapshots.draft.payload);
+  } finally {
+    await teardownHarness(harness);
+  }
+});
+
 test('cloud save_and_sync blocks destructive schedule loss and leaves published and draft unchanged', async () => {
   const harness = await setupHarness();
   try {
