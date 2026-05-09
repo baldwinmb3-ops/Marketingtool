@@ -1011,12 +1011,26 @@ async function createApp(options = {}) {
     return normalizeRole((req && req.auth && req.auth.payload && req.auth.payload.role) || (req && req.auth && req.auth.session && req.auth.session.activeRole));
   }
 
+  const MANAGER_DEPARTMENT_ALIAS_MAP = Object.freeze({
+    'marketing-dept-stores': 'manager-cat-stores',
+    'marketing-dept-store-broadway': 'manager-cat-stores',
+    'marketing-dept-store-barefoot': 'manager-cat-stores',
+    'marketing-dept-hotels': 'manager-cat-hotels',
+    'marketing-dept-inhouse': 'manager-cat-inhouse',
+  });
+
+  function normalizeManagerDepartmentScopeId(value) {
+    const raw = String(value || '').trim();
+    if (!raw) return '';
+    return MANAGER_DEPARTMENT_ALIAS_MAP[raw.toLowerCase()] || raw;
+  }
+
   function normalizeDepartmentScope(value) {
     const list = Array.isArray(value) ? value : [];
     const seen = new Set();
     const out = [];
     list.forEach((entry) => {
-      const id = String(entry || '').trim();
+      const id = normalizeManagerDepartmentScopeId(entry);
       if (!id || seen.has(id)) return;
       seen.add(id);
       out.push(id);
@@ -1031,6 +1045,40 @@ async function createApp(options = {}) {
     return a.some((entry) => b.has(entry));
   }
 
+  function managerOperationMetadata(row) {
+    return row && row.metadata && typeof row.metadata === 'object' && !Array.isArray(row.metadata) ? row.metadata : {};
+  }
+
+  function managerOperationTargetsActor(row, actorUser, targetUser = null) {
+    const op = row && typeof row === 'object' ? row : {};
+    const actor = actorUser && typeof actorUser === 'object' ? actorUser : {};
+    const target = targetUser && typeof targetUser === 'object' ? targetUser : null;
+    const metadata = managerOperationMetadata(op);
+    const actorId = String(actor.id || '').trim();
+    const actorWwid = normalizeWwid(actor.wwid || '');
+    const actorEmail = normalizeEmail(actor.email || '');
+    const localUserId = String(metadata.local_user_id ?? metadata.localUserId ?? '').trim();
+    const desiredWwid = normalizeWwid(op.wwid || '');
+    const desiredEmail = normalizeEmail(metadata.work_email ?? metadata.email ?? '');
+    if (target && actorId && String(target.id || '').trim() === actorId) return true;
+    if (localUserId && actorId && localUserId === actorId) return true;
+    if (desiredWwid && actorWwid && desiredWwid === actorWwid) return true;
+    return !!desiredEmail && !!actorEmail && desiredEmail === actorEmail;
+  }
+
+  function managerOperationRequestedDepartments(row) {
+    const metadata = managerOperationMetadata(row);
+    return normalizeDepartmentScope(metadata.department_ids ?? metadata.departmentIds).slice(0, 1);
+  }
+
+  function managerOperationCanSetOwnDepartment(row, actorUser, targetUser = null) {
+    const op = row && typeof row === 'object' ? row : {};
+    if (String(op.op || '').trim().toLowerCase() !== 'update_user') return false;
+    if (String(op.role || '').trim().toLowerCase() !== 'marketer') return false;
+    if (!managerOperationTargetsActor(op, actorUser, targetUser)) return false;
+    return managerOperationRequestedDepartments(op).length > 0;
+  }
+
   function managerTitleAppRole(title) {
     const normalized = normalizeManagerTitle(title, '');
     if (normalized === 'Assistant Manager') return 'assistant_manager';
@@ -1039,10 +1087,11 @@ async function createApp(options = {}) {
     return 'marketer';
   }
 
-  function managerUserOperationRestrictionMessage(userOps, actorDepartments = []) {
+  function managerUserOperationRestrictionMessage(userOps, actorDepartments = [], actorUser = null) {
     const list = Array.isArray(userOps) ? userOps : [];
     const scopedDepartments = normalizeDepartmentScope(actorDepartments);
-    if (!scopedDepartments.length) {
+    const selfDepartmentRepairOnly = list.length > 0 && list.every((op) => managerOperationCanSetOwnDepartment(op, actorUser));
+    if (!scopedDepartments.length && !selfDepartmentRepairOnly) {
       return 'Managers must belong to a department before creating users.';
     }
     for (const op of list) {
@@ -1088,6 +1137,8 @@ async function createApp(options = {}) {
     return list.map((entry) => {
       const row = entry && typeof entry === 'object' ? entry : {};
       const metadata = row.metadata && typeof row.metadata === 'object' && !Array.isArray(row.metadata) ? { ...row.metadata } : {};
+      const requestedDepartments = managerOperationRequestedDepartments({ ...row, metadata });
+      const preserveRequestedDepartments = managerOperationCanSetOwnDepartment({ ...row, metadata }, actorUser);
       const managerTitle = normalizeManagerTitle(metadata.manager_title ?? metadata.managerTitle, '');
       const wantsManagerAccess =
         !!metadata.can_access_manager ||
@@ -1097,7 +1148,7 @@ async function createApp(options = {}) {
         !!metadata.manager_only ||
         !!metadata.managerOnly ||
         !!managerTitle;
-      metadata.department_ids = actorDepartments.slice();
+      metadata.department_ids = preserveRequestedDepartments && requestedDepartments.length ? requestedDepartments : actorDepartments.slice();
       delete metadata.departmentIds;
       delete metadata.can_access_admin;
       delete metadata.canAccessAdmin;
@@ -2951,7 +3002,7 @@ async function createApp(options = {}) {
             return { status: 200, body: { ok: true, message: 'No user operations were supplied.', user_operations: { received: 0, applied: 0 } } };
           }
           if (canManager && !canAdmin) {
-            const restrictionMessage = managerUserOperationRestrictionMessage(userOps, req.auth.user && req.auth.user.departmentIds);
+            const restrictionMessage = managerUserOperationRestrictionMessage(userOps, req.auth.user && req.auth.user.departmentIds, req.auth.user);
             if (restrictionMessage) {
               return { status: 403, body: { ok: false, message: restrictionMessage } };
             }
