@@ -926,6 +926,125 @@ test('cloud booking_save preserves tour scheduling fields for existing booking r
   }
 });
 
+test('cloud booking_save preserves marketer cancel reasons and blocks admin claim on canceled requests', async () => {
+  const harness = await setupHarness();
+  try {
+    await signIn(harness);
+    const stamp = '2026-05-10T01:00:00.000Z';
+    await withDb(harness.db, async (db) => {
+      db.bookings = [
+        {
+          id: 'booking-cloud-cancel-1',
+          brandId: 'brand-pirates-voyage',
+          brandName: 'Pirates Voyage',
+          showDate: '2026-05-10',
+          showTime: '6:00 PM',
+          primaryShowDate: '2026-05-10',
+          primaryShowTime: '6:00 PM',
+          backupShowDate: '2026-05-11',
+          backupShowTime: '6:00 PM',
+          tourNumber: 'TOUR-CANCEL-1',
+          guestFirstName: 'Canceled',
+          guestLastName: 'Guest',
+          status: 'pending',
+          snapshotVersion: 1,
+          quoteLines: [],
+          authoritativeTotals: {},
+          commissionProfit: 0,
+          createdAt: stamp,
+          updatedAt: stamp,
+          revision: 1,
+        },
+      ];
+    });
+
+    const cancelReason = 'Guest called to cancel after changing travel plans.';
+    const canceledAt = '2026-05-10T01:05:00.000Z';
+    const cancelSave = await requestJson(harness, '/api/cloud', {
+      method: 'POST',
+      body: {
+        action: 'booking_save',
+        payload: {
+          meta: { source: 'booking-requests', updatedAt: canceledAt, version: 1 },
+          requests: [
+            {
+              id: 'booking-cloud-cancel-1',
+              brandId: 'brand-pirates-voyage',
+              brandName: 'Pirates Voyage',
+              showDate: '2026-05-10',
+              showTime: '6:00 PM',
+              primaryShowDate: '2026-05-10',
+              primaryShowTime: '6:00 PM',
+              backupShowDate: '2026-05-11',
+              backupShowTime: '6:00 PM',
+              tourNumber: 'TOUR-CANCEL-1',
+              guestFirstName: 'Canceled',
+              guestLastName: 'Guest',
+              status: 'canceled',
+              cancelReason,
+              canceledByName: 'Marketer One',
+              canceledByUserId: 'user-marketer-1',
+              canceledByDevice: 'marketer-web',
+              canceledAt,
+              statusAt: canceledAt,
+              snapshotVersion: 1,
+              quoteLines: [],
+              createdAt: stamp,
+              updatedAt: canceledAt,
+              revision: 1,
+            },
+          ],
+        },
+      },
+    });
+
+    assert.equal(cancelSave.status, 200, `Canceled booking_save failed: ${JSON.stringify(cancelSave.body)}`);
+    assert.equal(cancelSave.body.ok, true);
+    const cancelRows = (((cancelSave.body || {}).row || {}).payload || {}).requests || [];
+    const canceledRow = cancelRows.find((entry) => String((entry && entry.id) || '').trim() === 'booking-cloud-cancel-1');
+    assert.ok(canceledRow, 'Canceled row should remain in booking_save response.');
+    assert.equal(canceledRow.status, 'canceled');
+    assert.equal(canceledRow.cancelReason, cancelReason);
+    assert.equal(canceledRow.canceledByName, 'Marketer One');
+    assert.equal(canceledRow.canceledByDevice, 'marketer-web');
+
+    const bookingGet = await requestJson(harness, '/api/cloud', {
+      method: 'POST',
+      body: { action: 'booking_get' },
+    });
+
+    assert.equal(bookingGet.status, 200, `booking_get after cancel failed: ${JSON.stringify(bookingGet.body)}`);
+    assert.equal(bookingGet.body.ok, true);
+    const fetchedRows = (((bookingGet.body || {}).row || {}).payload || {}).requests || [];
+    const fetchedCanceled = fetchedRows.find((entry) => String((entry && entry.id) || '').trim() === 'booking-cloud-cancel-1');
+    assert.ok(fetchedCanceled, 'booking_get should keep canceled rows visible.');
+    assert.equal(fetchedCanceled.status, 'canceled');
+    assert.equal(fetchedCanceled.cancelReason, cancelReason);
+    assert.equal(fetchedCanceled.canceledAt, canceledAt);
+
+    const directClaim = await requestJson(harness, '/api/bookings/booking-cloud-cancel-1/claim', {
+      method: 'POST',
+      body: { actor_device: 'admin-direct' },
+    });
+    assert.equal(directClaim.status, 409, `Direct claim should be blocked for canceled rows: ${JSON.stringify(directClaim.body)}`);
+    assert.equal(directClaim.body.reason, 'already-canceled');
+
+    const cloudClaim = await requestJson(harness, '/api/cloud', {
+      method: 'POST',
+      body: {
+        action: 'booking_claim',
+        request_id: 'booking-cloud-cancel-1',
+        actor_device: 'admin-cloud',
+      },
+    });
+    assert.equal(cloudClaim.status, 200, `Cloud claim request failed unexpectedly: ${JSON.stringify(cloudClaim.body)}`);
+    assert.equal(cloudClaim.body.ok, false);
+    assert.equal(cloudClaim.body.reason, 'already-canceled');
+  } finally {
+    await teardownHarness(harness);
+  }
+});
+
 test('cloud health_check and auth_lookup still behave unchanged with save_and_sync_status support', async () => {
   const harness = await setupHarness();
   try {

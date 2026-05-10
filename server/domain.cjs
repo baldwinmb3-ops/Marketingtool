@@ -84,6 +84,7 @@ function bookingStatus(value) {
   const key = String(value ?? '').trim().toLowerCase();
   if (key === 'working' || key === 'booked') return 'working';
   if (key === 'done') return 'done';
+  if (key === 'canceled') return 'canceled';
   if (key === 'deleted') return 'deleted';
   return 'pending';
 }
@@ -110,6 +111,7 @@ function sanitizeBookingRow(input, defaults = {}) {
     tourLocation: String(src.tourLocation || base.tourLocation || '').trim(),
     tourTime: String(src.tourTime || base.tourTime || '').trim(),
     additionalNotes: String(src.additionalNotes || src.additional_notes || src.notes || base.additionalNotes || '').trim(),
+    cancelReason: String(src.cancelReason || src.cancel_reason || base.cancelReason || '').trim().slice(0, 400),
     status: bookingStatus(src.status || base.status),
     snapshotVersion: Math.max(1, toInt(src.snapshotVersion, toInt(base.snapshotVersion, 1))),
     quoteLines: sanitizeQuoteLines(src.quoteLines || base.quoteLines || []),
@@ -133,6 +135,10 @@ function sanitizeBookingRow(input, defaults = {}) {
     completedByUserId: String(src.completedByUserId || base.completedByUserId || '').trim(),
     completedByDevice: String(src.completedByDevice || base.completedByDevice || '').trim(),
     completedAt: String(src.completedAt || base.completedAt || ''),
+    canceledByName: String(src.canceledByName || src.canceled_by_name || base.canceledByName || '').trim(),
+    canceledByUserId: String(src.canceledByUserId || src.canceled_by_user_id || base.canceledByUserId || '').trim(),
+    canceledByDevice: String(src.canceledByDevice || src.canceled_by_device || base.canceledByDevice || '').trim(),
+    canceledAt: String(src.canceledAt || src.canceled_at || base.canceledAt || ''),
     statusAt: String(src.statusAt || base.statusAt || ''),
     createdAt: String(src.createdAt || base.createdAt || nowIso()),
     updatedAt: String(src.updatedAt || base.updatedAt || nowIso()),

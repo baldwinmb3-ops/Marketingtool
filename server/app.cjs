@@ -1867,6 +1867,9 @@ async function createApp(options = {}) {
         const actorName = String(req.auth.user.displayName || '').trim() || 'Admin';
         const actorUserId = String(req.auth.user.id || '').trim();
         const actorDevice = String((req.body && req.body.actor_device) || 'web').trim();
+        if (status === 'canceled') {
+          return { status: 409, body: { ok: false, reason: 'already-canceled', message: 'Canceled requests cannot be marked done.' } };
+        }
         if (status === 'done') {
           return { status: 409, body: { ok: false, reason: 'already-done', message: 'Request is already done.', lock: bookingLockFromRow(found) } };
         }
@@ -1922,6 +1925,9 @@ async function createApp(options = {}) {
         const actorName = String(req.auth.user.displayName || '').trim() || 'Admin';
         const actorUserId = String(req.auth.user.id || '').trim();
         const actorDevice = String((req.body && req.body.actor_device) || 'web').trim();
+        if (status === 'canceled') {
+          return { status: 409, body: { ok: false, reason: 'already-canceled', message: 'Canceled requests cannot be claimed.' } };
+        }
         if (status === 'done') {
           return { status: 409, body: { ok: false, reason: 'already-done', message: 'Request is already done.', lock: bookingLockFromRow(found) } };
         }
@@ -1975,6 +1981,9 @@ async function createApp(options = {}) {
         }
         const status = bookingStatus(found.status);
         const actorUserId = String(req.auth.user.id || '').trim();
+        if (status === 'canceled') {
+          return { status: 409, body: { ok: false, reason: 'already-canceled', message: 'Canceled requests cannot be released.' } };
+        }
         if (status === 'done') {
           return { status: 409, body: { ok: false, reason: 'already-done', message: 'Done requests cannot be released.' } };
         }
@@ -2484,6 +2493,9 @@ async function createApp(options = {}) {
           const status = bookingStatus(found.status);
 
           if (action === 'booking_claim') {
+            if (status === 'canceled') {
+              return { status: 200, body: { ok: false, reason: 'already-canceled', message: 'Canceled requests cannot be claimed.' } };
+            }
             if (status === 'done') {
               return { status: 200, body: { ok: false, reason: 'already-done', message: 'Already marked Done.', lock: bookingLockFromRow(found) } };
             }
@@ -2532,6 +2544,9 @@ async function createApp(options = {}) {
           }
 
           if (action === 'booking_complete') {
+            if (status === 'canceled') {
+              return { status: 200, body: { ok: false, reason: 'already-canceled', message: 'Canceled requests cannot be marked done.' } };
+            }
             if (status === 'done') {
               return { status: 200, body: { ok: false, reason: 'already-done', message: 'Already marked Done.', lock: bookingLockFromRow(found) } };
             }
@@ -2631,6 +2646,9 @@ async function createApp(options = {}) {
             return { status: 200, body: { ok: true, message: 'Booking canceled and removed from queue.' } };
           }
 
+          if (status === 'canceled') {
+            return { status: 200, body: { ok: false, reason: 'already-canceled', message: 'Canceled requests cannot be released.' } };
+          }
           if (status === 'done') {
             return { status: 200, body: { ok: false, reason: 'already-done', message: 'Done requests cannot be released.' } };
           }
