@@ -838,6 +838,94 @@ test('cloud booking_get and catalog_get_live remain stable immediately after a n
   }
 });
 
+test('cloud booking_save preserves tour scheduling fields for existing booking rows', async () => {
+  const harness = await setupHarness();
+  try {
+    await signIn(harness);
+    const stamp = '2026-05-10T00:00:00.000Z';
+    await withDb(harness.db, async (db) => {
+      db.bookings = [
+        {
+          id: 'booking-tour-fields-1',
+          brandId: 'brand-pirates-voyage',
+          brandName: 'Pirates Voyage',
+          showDate: '2026-05-10',
+          showTime: '6:00 PM',
+          primaryShowDate: '2026-05-10',
+          primaryShowTime: '6:00 PM',
+          backupShowDate: '2026-05-11',
+          backupShowTime: '6:00 PM',
+          tourNumber: '1234',
+          status: 'done',
+          snapshotVersion: 1,
+          quoteLines: [],
+          authoritativeTotals: {},
+          commissionProfit: 0,
+          createdAt: stamp,
+          updatedAt: stamp,
+          revision: 1,
+        },
+      ];
+    });
+
+    const save = await requestJson(harness, '/api/cloud', {
+      method: 'POST',
+      body: {
+        action: 'booking_save',
+        payload: {
+          meta: { source: 'booking-requests', updatedAt: stamp, version: 1 },
+          requests: [
+            {
+              id: 'booking-tour-fields-1',
+              brandId: 'brand-pirates-voyage',
+              brandName: 'Pirates Voyage',
+              showDate: '2026-05-10',
+              showTime: '6:00 PM',
+              primaryShowDate: '2026-05-10',
+              primaryShowTime: '6:00 PM',
+              backupShowDate: '2026-05-11',
+              backupShowTime: '6:00 PM',
+              tourNumber: '1234',
+              guestEmail: 'guest@example.com',
+              tourDate: '2026-05-10',
+              tourLocation: 'Frontline',
+              tourTime: '9:00 AM',
+              additionalNotes: 'Window seat requested.',
+              status: 'done',
+              snapshotVersion: 1,
+              quoteLines: [],
+              createdAt: stamp,
+              updatedAt: stamp,
+              revision: 1,
+            },
+          ],
+        },
+      },
+    });
+
+    assert.equal(save.status, 200, `booking_save should preserve tour fields: ${JSON.stringify(save.body)}`);
+    assert.equal(save.body.ok, true);
+
+    const bookingGet = await requestJson(harness, '/api/cloud', {
+      method: 'POST',
+      body: { action: 'booking_get' },
+    });
+
+    assert.equal(bookingGet.status, 200, `booking_get should succeed after booking_save: ${JSON.stringify(bookingGet.body)}`);
+    assert.equal(bookingGet.body.ok, true);
+    const rows = (((bookingGet.body || {}).row || {}).payload || {}).requests || [];
+    const row = rows.find((entry) => String((entry && entry.id) || '').trim() === 'booking-tour-fields-1') || null;
+    assert.ok(row, 'Expected saved booking row in booking_get payload');
+    assert.equal(row.guestEmail, 'guest@example.com');
+    assert.equal(row.tourDate, '2026-05-10');
+    assert.equal(row.tourLocation, 'Frontline');
+    assert.equal(row.tourTime, '9:00 AM');
+    assert.equal(row.additionalNotes, 'Window seat requested.');
+  } finally {
+    await teardownHarness(harness);
+  }
+});
+
 test('cloud health_check and auth_lookup still behave unchanged with save_and_sync_status support', async () => {
   const harness = await setupHarness();
   try {
