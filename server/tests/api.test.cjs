@@ -1291,6 +1291,150 @@ test('cloud save_and_sync blocks removing a whole live show date and its slot st
   }
 });
 
+test('cloud save_and_sync allows intentional live dated-slot removal when publish_intent exactly matches the removed slot', async () => {
+  const harness = await setupHarness();
+  try {
+    await signIn(harness);
+    const initial = await latestPublishedSnapshot(harness);
+    const scheduledPayload = buildScheduledCatalogPayload(initial.body.snapshot);
+    const medievalSeed = ensureBrand(scheduledPayload, 'brand-medieval-times', { name: 'Medieval Times' });
+    medievalSeed.showScheduleWeekly = {
+      '1': ['7:00 PM', '9:00 PM'],
+      '2': ['7:00 PM'],
+    };
+    await seedPublishedSnapshot(harness.db, scheduledPayload, 2);
+
+    const current = await latestPublishedSnapshot(harness);
+    const payload = deepClone(current.body.snapshot);
+    const medieval = ensureBrand(payload, 'brand-medieval-times', { name: 'Medieval Times' });
+    delete medieval.showScheduleDates['2026-06-02'];
+
+    const saveSend = await requestJson(harness, '/api/cloud', {
+      method: 'POST',
+      body: {
+        action: 'save_and_sync',
+        request_id: 'intentional-live-time-removal',
+        payload,
+        publish_intent: {
+          brand_id: 'brand-medieval-times',
+          removed_schedule_slots: ['2026-06-02|7:00 PM'],
+          source: 'admin-calendar',
+          kind: 'admin_calendar_schedule_edit',
+        },
+      },
+    });
+
+    assert.equal(saveSend.status, 200, `Intentional dated-slot removal should publish: ${JSON.stringify(saveSend.body)}`);
+    assert.equal(saveSend.body.ok, true);
+    assert.equal(saveSend.body.status, 'confirmed_success');
+
+    const afterPublished = await latestPublishedSnapshot(harness);
+    assert.equal(Number(afterPublished.body.metadata && afterPublished.body.metadata.version), 3);
+    const afterMedieval = ensureBrand(afterPublished.body.snapshot, 'brand-medieval-times', { name: 'Medieval Times' });
+    assert.deepEqual(afterMedieval.showScheduleDates, {
+      '2026-06-01': ['7:00 PM', '9:00 PM'],
+    });
+    assert.deepEqual(afterMedieval.showScheduleWeekly || {}, medievalSeed.showScheduleWeekly || {});
+  } finally {
+    await teardownHarness(harness);
+  }
+});
+
+test('cloud save_and_sync blocks publish_intent when it would clear every live show time for a brand', async () => {
+  const harness = await setupHarness();
+  try {
+    await signIn(harness);
+    const initial = await latestPublishedSnapshot(harness);
+    const scheduledPayload = buildScheduledCatalogPayload(initial.body.snapshot);
+    await seedPublishedSnapshot(harness.db, scheduledPayload, 2);
+    const beforeState = await readDb(harness.db);
+
+    const current = await latestPublishedSnapshot(harness);
+    const payload = deepClone(current.body.snapshot);
+    const medieval = ensureBrand(payload, 'brand-medieval-times', { name: 'Medieval Times' });
+    medieval.showScheduleDates = {};
+    medieval.showScheduleStatus = {};
+    medieval.showScheduleWeekly = {};
+
+    const saveSend = await requestJson(harness, '/api/cloud', {
+      method: 'POST',
+      body: {
+        action: 'save_and_sync',
+        request_id: 'intent-cannot-clear-brand-schedule',
+        payload,
+        publish_intent: {
+          brand_id: 'brand-medieval-times',
+          removed_schedule_slots: ['2026-06-01|7:00 PM', '2026-06-01|9:00 PM', '2026-06-02|7:00 PM'],
+          source: 'admin-calendar',
+          kind: 'admin_calendar_schedule_edit',
+        },
+      },
+    });
+
+    assert.equal(saveSend.status, 409, `Full-brand schedule wipe should stay blocked: ${JSON.stringify(saveSend.body)}`);
+    assert.equal(saveSend.body.ok, false);
+    assert.equal(saveSend.body.code, DESTRUCTIVE_PUBLISH_BLOCKED_CODE);
+    assert.match(String(saveSend.body.message || ''), /clear every live show time/i);
+    assert.ok(Array.isArray(saveSend.body.unexplained_affected_brands));
+    assert.equal(String((saveSend.body.unexplained_affected_brands[0] && saveSend.body.unexplained_affected_brands[0].reason) || ''), 'all-brand-times-removed');
+
+    const afterPublished = await latestPublishedSnapshot(harness);
+    assert.equal(Number(afterPublished.body.metadata && afterPublished.body.metadata.version), 2);
+    assert.deepEqual(afterPublished.body.snapshot, beforeState.snapshots.published.payload);
+  } finally {
+    await teardownHarness(harness);
+  }
+});
+
+test('cloud save_and_sync blocks publish_intent that names another brand while deleting a live show time', async () => {
+  const harness = await setupHarness();
+  try {
+    await signIn(harness);
+    const initial = await latestPublishedSnapshot(harness);
+    const scheduledPayload = buildScheduledCatalogPayload(initial.body.snapshot);
+    const medievalSeed = ensureBrand(scheduledPayload, 'brand-medieval-times', { name: 'Medieval Times' });
+    medievalSeed.showScheduleWeekly = {
+      '1': ['7:00 PM', '9:00 PM'],
+      '2': ['7:00 PM'],
+    };
+    await seedPublishedSnapshot(harness.db, scheduledPayload, 2);
+    const beforeState = await readDb(harness.db);
+
+    const current = await latestPublishedSnapshot(harness);
+    const payload = deepClone(current.body.snapshot);
+    const medieval = ensureBrand(payload, 'brand-medieval-times', { name: 'Medieval Times' });
+    delete medieval.showScheduleDates['2026-06-02'];
+
+    const saveSend = await requestJson(harness, '/api/cloud', {
+      method: 'POST',
+      body: {
+        action: 'save_and_sync',
+        request_id: 'intent-cannot-delete-other-brand-time',
+        payload,
+        publish_intent: {
+          brand_id: 'brand-carolina-opry',
+          removed_schedule_slots: ['2026-06-02|7:00 PM'],
+          source: 'admin-calendar',
+          kind: 'admin_calendar_schedule_edit',
+        },
+      },
+    });
+
+    assert.equal(saveSend.status, 409, `Wrong-brand publish_intent should be blocked: ${JSON.stringify(saveSend.body)}`);
+    assert.equal(saveSend.body.ok, false);
+    assert.equal(saveSend.body.code, DESTRUCTIVE_PUBLISH_BLOCKED_CODE);
+    assert.match(String(saveSend.body.message || ''), /did not record an explicit calendar removal/i);
+    assert.ok(Array.isArray(saveSend.body.unexplained_affected_brands));
+    assert.equal(String((saveSend.body.unexplained_affected_brands[0] && saveSend.body.unexplained_affected_brands[0].reason) || ''), 'missing-brand-intent');
+
+    const afterPublished = await latestPublishedSnapshot(harness);
+    assert.equal(Number(afterPublished.body.metadata && afterPublished.body.metadata.version), 2);
+    assert.deepEqual(afterPublished.body.snapshot, beforeState.snapshots.published.payload);
+  } finally {
+    await teardownHarness(harness);
+  }
+});
+
 test('cloud save_and_sync blocks removing weekly schedule templates even when dated slots remain', async () => {
   const harness = await setupHarness();
   try {
@@ -1345,6 +1489,57 @@ test('cloud save_and_sync blocks removing weekly schedule templates even when da
   }
 });
 
+test('cloud save_and_sync blocks weekly-template deletion even when publish_intent names the removed weekly slot', async () => {
+  const harness = await setupHarness();
+  try {
+    await signIn(harness);
+    const initial = await latestPublishedSnapshot(harness);
+    const scheduledPayload = buildScheduledCatalogPayload(initial.body.snapshot);
+    const medievalSeed = ensureBrand(scheduledPayload, 'brand-medieval-times', { name: 'Medieval Times' });
+    medievalSeed.showScheduleWeekly = {
+      '1': ['7:00 PM', '9:00 PM'],
+      '2': ['7:00 PM'],
+    };
+    await seedPublishedSnapshot(harness.db, scheduledPayload, 2);
+    const beforeState = await readDb(harness.db);
+
+    const current = await latestPublishedSnapshot(harness);
+    const payload = deepClone(current.body.snapshot);
+    const medieval = ensureBrand(payload, 'brand-medieval-times', { name: 'Medieval Times' });
+    medieval.showScheduleWeekly = {
+      '1': ['7:00 PM', '9:00 PM'],
+    };
+
+    const saveSend = await requestJson(harness, '/api/cloud', {
+      method: 'POST',
+      body: {
+        action: 'save_and_sync',
+        request_id: 'intent-cannot-delete-weekly-template',
+        payload,
+        publish_intent: {
+          brand_id: 'brand-medieval-times',
+          removed_weekly_slots: ['2|7:00 PM'],
+          source: 'admin-calendar',
+          kind: 'admin_calendar_schedule_edit',
+        },
+      },
+    });
+
+    assert.equal(saveSend.status, 409, `Weekly-template deletion should stay blocked even with intent: ${JSON.stringify(saveSend.body)}`);
+    assert.equal(saveSend.body.ok, false);
+    assert.equal(saveSend.body.code, DESTRUCTIVE_PUBLISH_BLOCKED_CODE);
+    assert.match(String(saveSend.body.message || ''), /weekly schedule templates/i, 'Intent must not authorize weekly-template deletion.');
+    assert.ok(Array.isArray(saveSend.body.unexplained_affected_brands));
+    assert.equal(String((saveSend.body.unexplained_affected_brands[0] && saveSend.body.unexplained_affected_brands[0].reason) || ''), 'weekly-slot-removal');
+
+    const afterPublished = await latestPublishedSnapshot(harness);
+    assert.equal(Number(afterPublished.body.metadata && afterPublished.body.metadata.version), 2);
+    assert.deepEqual(afterPublished.body.snapshot, beforeState.snapshots.published.payload);
+  } finally {
+    await teardownHarness(harness);
+  }
+});
+
 test('cloud save_and_sync blocks destructive schedule loss on an unrelated scheduled brand in the same payload', async () => {
   const harness = await setupHarness();
   try {
@@ -1391,6 +1586,58 @@ test('cloud save_and_sync blocks destructive schedule loss on an unrelated sched
   }
 });
 
+test('cloud save_and_sync blocks partial payload destructive loss even when publish_intent explains one brand edit', async () => {
+  const harness = await setupHarness();
+  try {
+    await signIn(harness);
+    const initial = await latestPublishedSnapshot(harness);
+    const scheduledPayload = buildScheduledCatalogPayload(initial.body.snapshot);
+    const medievalSeed = ensureBrand(scheduledPayload, 'brand-medieval-times', { name: 'Medieval Times' });
+    medievalSeed.showScheduleWeekly = {
+      '1': ['7:00 PM', '9:00 PM'],
+      '2': ['7:00 PM'],
+    };
+    await seedPublishedSnapshot(harness.db, scheduledPayload, 2);
+    const beforeState = await readDb(harness.db);
+
+    const current = await latestPublishedSnapshot(harness);
+    const payload = deepClone(current.body.snapshot);
+    payload.brands = (Array.isArray(payload.brands) ? payload.brands : []).filter((entry) => String((entry && entry.id) || '') === 'brand-medieval-times');
+    const medieval = ensureBrand(payload, 'brand-medieval-times', { name: 'Medieval Times' });
+    delete medieval.showScheduleDates['2026-06-02'];
+
+    const saveSend = await requestJson(harness, '/api/cloud', {
+      method: 'POST',
+      body: {
+        action: 'save_and_sync',
+        request_id: 'intent-cannot-bypass-partial-payload-loss',
+        payload,
+        publish_intent: {
+          brand_id: 'brand-medieval-times',
+          removed_schedule_slots: ['2026-06-02|7:00 PM'],
+          source: 'admin-calendar',
+          kind: 'admin_calendar_schedule_edit',
+        },
+      },
+    });
+
+    assert.equal(saveSend.status, 409, `Partial-payload destructive loss should stay blocked: ${JSON.stringify(saveSend.body)}`);
+    assert.equal(saveSend.body.ok, false);
+    assert.equal(saveSend.body.code, DESTRUCTIVE_PUBLISH_BLOCKED_CODE);
+    assert.ok(
+      Array.isArray(saveSend.body.affected_brands) &&
+        saveSend.body.affected_brands.some((entry) => String(entry.id || '') === 'brand-carolina-opry'),
+      `Expected Carolina Opry in affected brands for partial payload loss: ${JSON.stringify(saveSend.body.affected_brands)}`,
+    );
+
+    const afterPublished = await latestPublishedSnapshot(harness);
+    assert.equal(Number(afterPublished.body.metadata && afterPublished.body.metadata.version), 2);
+    assert.deepEqual(afterPublished.body.snapshot, beforeState.snapshots.published.payload);
+  } finally {
+    await teardownHarness(harness);
+  }
+});
+
 test('cloud save_and_sync blocks destructive schedule loss and leaves published and draft unchanged', async () => {
   const harness = await setupHarness();
   try {
@@ -1418,12 +1665,14 @@ test('cloud save_and_sync blocks destructive schedule loss and leaves published 
     assert.equal(saveSend.status, 409, `Destructive publish should be blocked: ${JSON.stringify(saveSend.body)}`);
     assert.equal(saveSend.body.ok, false);
     assert.equal(saveSend.body.code, DESTRUCTIVE_PUBLISH_BLOCKED_CODE);
-    assert.equal(saveSend.body.message, 'Publish blocked because it would remove existing show dates/times. Use explicit restore mode if this is intentional disaster recovery.');
+    assert.match(String(saveSend.body.message || ''), /did not record an explicit calendar removal/i);
     assert.ok(
       Array.isArray(saveSend.body.affected_brands) &&
         saveSend.body.affected_brands.some((entry) => String(entry.id || '') === 'brand-medieval-times'),
       `Expected Medieval Times in affected brands: ${JSON.stringify(saveSend.body.affected_brands)}`,
     );
+    assert.ok(Array.isArray(saveSend.body.unexplained_affected_brands));
+    assert.equal(String((saveSend.body.unexplained_affected_brands[0] && saveSend.body.unexplained_affected_brands[0].reason) || ''), 'missing-brand-intent');
 
     const afterPublished = await latestPublishedSnapshot(harness);
     assert.equal(Number(afterPublished.body.metadata && afterPublished.body.metadata.version), 2);
@@ -1489,6 +1738,45 @@ test('cloud save_and_sync blocks stale 73-brand seed/default payload before publ
     assert.equal(String((audit.details && audit.details.code) || ''), PUBLISH_BASE_VERSION_STALE_CODE);
     assert.equal(Number((audit.details && audit.details.currentVersion) || 0), 2);
     assert.equal(Number((audit.details && audit.details.baseVersion) || 0), 1);
+  } finally {
+    await teardownHarness(harness);
+  }
+});
+
+test('cloud save_and_sync blocks stale publish_intent payloads before destructive intent is considered', async () => {
+  const harness = await setupHarness();
+  try {
+    await signIn(harness);
+    const initial = await latestPublishedSnapshot(harness);
+    const staleSeedPayload = deepClone(initial.body.snapshot);
+    const scheduledPayload = buildScheduledCatalogPayload(initial.body.snapshot);
+    await seedPublishedSnapshot(harness.db, scheduledPayload, 2);
+    const beforeState = await readDb(harness.db);
+
+    const saveSend = await requestJson(harness, '/api/cloud', {
+      method: 'POST',
+      body: {
+        action: 'save_and_sync',
+        request_id: 'stale-intent-publish',
+        payload: staleSeedPayload,
+        publish_intent: {
+          brand_id: 'brand-medieval-times',
+          removed_schedule_slots: ['2026-06-02|7:00 PM'],
+          source: 'admin-calendar',
+          kind: 'admin_calendar_schedule_edit',
+        },
+      },
+    });
+
+    assert.equal(saveSend.status, 409, `Stale payloads should stay blocked even with intent: ${JSON.stringify(saveSend.body)}`);
+    assert.equal(saveSend.body.ok, false);
+    assert.equal(saveSend.body.code, PUBLISH_BASE_VERSION_STALE_CODE);
+    assert.equal(saveSend.body.current_published_version, 2);
+    assert.equal(saveSend.body.base_snapshot_version, 1);
+
+    const afterPublished = await latestPublishedSnapshot(harness);
+    assert.equal(Number(afterPublished.body.metadata && afterPublished.body.metadata.version), 2);
+    assert.deepEqual(afterPublished.body.snapshot, beforeState.snapshots.published.payload);
   } finally {
     await teardownHarness(harness);
   }

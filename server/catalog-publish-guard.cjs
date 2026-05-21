@@ -85,6 +85,58 @@ function normalizeScheduleWeekly(raw) {
   return out;
 }
 
+function normalizeScheduleSlotKey(value) {
+  const raw = String(value || '').trim();
+  if (!raw) return '';
+  const parts = raw.split('|');
+  if (parts.length !== 2) return '';
+  const dateKey = normalizeDateKey(parts[0]);
+  const timeKey = normalizeTimeKey(parts[1]);
+  return dateKey && timeKey ? `${dateKey}|${timeKey}` : '';
+}
+
+function normalizeWeeklySlotKey(value) {
+  const raw = String(value || '').trim();
+  if (!raw) return '';
+  const parts = raw.split('|');
+  if (parts.length !== 2) return '';
+  const dayKey = normalizeWeekdayKey(parts[0]);
+  const timeKey = normalizeTimeKey(parts[1]);
+  return dayKey && timeKey ? `${dayKey}|${timeKey}` : '';
+}
+
+function normalizeCalendarPublishIntent(raw) {
+  const rows = Array.isArray(raw)
+    ? raw
+    : raw && typeof raw === 'object' && Array.isArray(raw.brand_changes)
+      ? raw.brand_changes
+      : raw && typeof raw === 'object'
+        ? [raw]
+        : [];
+  const out = new Map();
+  for (const entry of rows) {
+    const row = entry && typeof entry === 'object' && !Array.isArray(entry) ? entry : {};
+    const brandId = String(row.brand_id || row.brandId || '').trim();
+    if (!brandId) continue;
+    out.set(brandId, {
+      brandId,
+      removedScheduleSlots: uniqueSortedStrings(
+        (Array.isArray(row.removed_schedule_slots) ? row.removed_schedule_slots : row.removedScheduleSlots || []).map(
+          normalizeScheduleSlotKey,
+        ),
+      ),
+      removedWeeklySlots: uniqueSortedStrings(
+        (Array.isArray(row.removed_weekly_slots) ? row.removed_weekly_slots : row.removedWeeklySlots || []).map(
+          normalizeWeeklySlotKey,
+        ),
+      ),
+      source: String(row.source || '').trim(),
+      kind: String(row.kind || '').trim(),
+    });
+  }
+  return out;
+}
+
 function buildBrandScheduleState(brand) {
   const row = brand && typeof brand === 'object' ? brand : {};
   const id = String(row.id || '').trim();
@@ -186,9 +238,10 @@ function summarizeScheduleCounts(summary) {
   };
 }
 
-function diffCatalogScheduleImpact(currentPayload, incomingPayload) {
+function diffCatalogScheduleImpact(currentPayload, incomingPayload, opts = {}) {
   const beforeSummary = buildCatalogScheduleSummary(currentPayload);
   const afterSummary = buildCatalogScheduleSummary(incomingPayload);
+  const includeInternalKeys = !!(opts && opts.includeInternalKeys);
   const affectedBrands = [];
 
   for (const currentBrand of beforeSummary.brands) {
@@ -208,8 +261,9 @@ function diffCatalogScheduleImpact(currentPayload, incomingPayload) {
         ? currentBrand.weeklySlotKeys.slice()
         : subtractKeys(currentBrand.weeklySlotKeys, nextBrand.weeklySlotKeys);
 
-    // Status-only removals can legitimately revert a live slot back to available.
-    // Only real dated-slot loss or weekly-template loss should trip the destructive guard.
+    // Status-only removals can legitimately mean "revert this time back to available"
+    // while keeping the underlying live schedule slot intact. The destructive publish
+    // guard should only block actual dated slot loss or weekly template loss.
     if (!removedScheduleSlotKeys.length && !removedWeeklySlotKeys.length) continue;
 
     affectedBrands.push({
@@ -227,6 +281,8 @@ function diffCatalogScheduleImpact(currentPayload, incomingPayload) {
       removedScheduleSlotCount: removedScheduleSlotKeys.length,
       removedStatusEntryCount: removedStatusEntryKeys.length,
       removedWeeklySlotCount: removedWeeklySlotKeys.length,
+      removedScheduleSlotKeys: includeInternalKeys ? removedScheduleSlotKeys.slice() : undefined,
+      removedWeeklySlotKeys: includeInternalKeys ? removedWeeklySlotKeys.slice() : undefined,
       removedScheduleSlotsSample: removedScheduleSlotKeys.slice(0, 25),
       removedStatusEntriesSample: removedStatusEntryKeys.slice(0, 25),
       removedWeeklySlotsSample: removedWeeklySlotKeys.slice(0, 25),
@@ -258,6 +314,112 @@ function extractCatalogBaseVersion(payload, explicitBaseVersion) {
   return 0;
 }
 
+function buildIntentMismatchBrandImpact(brandImpact, reason, extra = {}) {
+  return {
+    id: String((brandImpact && brandImpact.id) || '').trim(),
+    name: String((brandImpact && brandImpact.name) || '').trim(),
+    reason: String(reason || 'intent-mismatch').trim() || 'intent-mismatch',
+    removed_schedule_slot_count: Number((brandImpact && brandImpact.removedScheduleSlotCount) || 0),
+    removed_weekly_slot_count: Number((brandImpact && brandImpact.removedWeeklySlotCount) || 0),
+    removed_schedule_slots_sample: Array.isArray(brandImpact && brandImpact.removedScheduleSlotsSample)
+      ? brandImpact.removedScheduleSlotsSample.slice(0, 10)
+      : [],
+    removed_weekly_slots_sample: Array.isArray(brandImpact && brandImpact.removedWeeklySlotsSample)
+      ? brandImpact.removedWeeklySlotsSample.slice(0, 10)
+      : [],
+    ...extra,
+  };
+}
+
+function buildIntentMismatchMessage(rows) {
+  const first = Array.isArray(rows) ? rows[0] : null;
+  const brandName = String((first && first.name) || 'the live schedule').trim() || 'the live schedule';
+  if (!first) {
+    return DESTRUCTIVE_PUBLISH_BLOCKED_MESSAGE;
+  }
+  if (first.reason === 'missing-brand-intent') {
+    return `Publish blocked because it would remove existing show dates/times on ${brandName}, but this browser did not record an explicit calendar removal for that brand. Review the live schedule and try again.`;
+  }
+  if (first.reason === 'brand-missing-from-incoming') {
+    return `Publish blocked because it would remove existing show dates/times by omitting ${brandName} from the outgoing catalog. Reload live catalog and review the edited brand before trying again.`;
+  }
+  if (first.reason === 'weekly-slot-removal') {
+    return `Publish blocked because it would remove existing show dates/times from weekly schedule templates on ${brandName}. Explicit calendar publishes can remove dated slots only; weekly template loss still requires a safer recovery path.`;
+  }
+  if (first.reason === 'all-brand-times-removed') {
+    return `Publish blocked because it would clear every live show time for ${brandName}. Explicit calendar publishes can remove selected dated slots, but they cannot wipe a brand's schedule entirely.`;
+  }
+  if (first.reason === 'schedule-slot-not-in-intent') {
+    const sample =
+      Array.isArray(first.unexplained_schedule_slots_sample) && first.unexplained_schedule_slots_sample[0]
+        ? ` including ${String(first.unexplained_schedule_slots_sample[0] || '').trim()}`
+        : '';
+    return `Publish blocked because it would remove existing show dates/times outside the explicit calendar edit for ${brandName}${sample}. Review the live schedule and try again.`;
+  }
+  return DESTRUCTIVE_PUBLISH_BLOCKED_MESSAGE;
+}
+
+function assessIntentionalScheduleRemovals(impact, publishIntent) {
+  const affectedBrands = Array.isArray(impact && impact.affectedBrands) ? impact.affectedBrands : [];
+  if (!affectedBrands.length) {
+    return { allowed: true, unexplainedAffectedBrands: [], message: '' };
+  }
+  const intentByBrand = normalizeCalendarPublishIntent(publishIntent);
+  if (!intentByBrand.size) {
+    const unexplainedAffectedBrands = affectedBrands.map((brandImpact) =>
+      buildIntentMismatchBrandImpact(brandImpact, 'missing-brand-intent'),
+    );
+    return {
+      allowed: false,
+      unexplainedAffectedBrands,
+      message: buildIntentMismatchMessage(unexplainedAffectedBrands),
+    };
+  }
+  const unexplainedAffectedBrands = [];
+  for (const brandImpact of affectedBrands) {
+    const intent = intentByBrand.get(String((brandImpact && brandImpact.id) || '').trim());
+    if (!intent) {
+      unexplainedAffectedBrands.push(buildIntentMismatchBrandImpact(brandImpact, 'missing-brand-intent'));
+      continue;
+    }
+    if (!!brandImpact.missingFromIncoming || !brandImpact.afterActive) {
+      unexplainedAffectedBrands.push(buildIntentMismatchBrandImpact(brandImpact, 'brand-missing-from-incoming'));
+      continue;
+    }
+    const removedWeeklySlotKeys = Array.isArray(brandImpact.removedWeeklySlotKeys)
+      ? brandImpact.removedWeeklySlotKeys
+      : [];
+    if (removedWeeklySlotKeys.length) {
+      unexplainedAffectedBrands.push(buildIntentMismatchBrandImpact(brandImpact, 'weekly-slot-removal'));
+      continue;
+    }
+    if (
+      Number(brandImpact.beforeScheduleSlotCount || 0) > 0 &&
+      Number(brandImpact.afterScheduleSlotCount || 0) === 0 &&
+      Number(brandImpact.afterWeeklySlotCount || 0) === 0
+    ) {
+      unexplainedAffectedBrands.push(buildIntentMismatchBrandImpact(brandImpact, 'all-brand-times-removed'));
+      continue;
+    }
+    const allowedScheduleSlots = new Set(Array.isArray(intent.removedScheduleSlots) ? intent.removedScheduleSlots : []);
+    const unexplainedScheduleSlots = (
+      Array.isArray(brandImpact.removedScheduleSlotKeys) ? brandImpact.removedScheduleSlotKeys : []
+    ).filter((slotKey) => !allowedScheduleSlots.has(slotKey));
+    if (unexplainedScheduleSlots.length) {
+      unexplainedAffectedBrands.push(
+        buildIntentMismatchBrandImpact(brandImpact, 'schedule-slot-not-in-intent', {
+          unexplained_schedule_slots_sample: unexplainedScheduleSlots.slice(0, 10),
+        }),
+      );
+    }
+  }
+  return {
+    allowed: unexplainedAffectedBrands.length === 0,
+    unexplainedAffectedBrands,
+    message: unexplainedAffectedBrands.length ? buildIntentMismatchMessage(unexplainedAffectedBrands) : '',
+  };
+}
+
 function assessCatalogPublishSafety(options = {}) {
   const currentPublished = options.currentPublished && typeof options.currentPublished === 'object' ? options.currentPublished : null;
   const incomingPayload = options.incomingPayload && typeof options.incomingPayload === 'object' ? options.incomingPayload : {};
@@ -270,7 +432,8 @@ function assessCatalogPublishSafety(options = {}) {
     toInt(currentPublished && currentPublished.version, toInt(currentPayload && currentPayload.meta && currentPayload.meta.version, 1)),
   );
   const baseVersion = extractCatalogBaseVersion(incomingPayload, options.explicitBaseVersion);
-  const impact = diffCatalogScheduleImpact(currentPayload, incomingPayload);
+  const impact = diffCatalogScheduleImpact(currentPayload, incomingPayload, { includeInternalKeys: true });
+  const intentAssessment = assessIntentionalScheduleRemovals(impact, options.publishIntent);
 
   let block = null;
   if (baseVersion <= 0) {
@@ -291,11 +454,11 @@ function assessCatalogPublishSafety(options = {}) {
       code: PUBLISH_BASE_VERSION_INVALID_CODE,
       message: PUBLISH_BASE_VERSION_INVALID_MESSAGE,
     };
-  } else if (impact.destructive) {
+  } else if (impact.destructive && !intentAssessment.allowed) {
     block = {
       status: 409,
       code: DESTRUCTIVE_PUBLISH_BLOCKED_CODE,
-      message: DESTRUCTIVE_PUBLISH_BLOCKED_MESSAGE,
+      message: intentAssessment.message || DESTRUCTIVE_PUBLISH_BLOCKED_MESSAGE,
     };
   }
 
@@ -303,6 +466,7 @@ function assessCatalogPublishSafety(options = {}) {
     currentVersion,
     baseVersion,
     impact,
+    intentAssessment,
     block,
   };
 }

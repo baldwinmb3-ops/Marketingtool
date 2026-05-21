@@ -334,6 +334,15 @@ function publishBlockedResponse(block, assessment, extras = {}) {
   };
 }
 
+function publishIntentResponseExtras(assessment) {
+  return assessment &&
+    assessment.intentAssessment &&
+    Array.isArray(assessment.intentAssessment.unexplainedAffectedBrands) &&
+    assessment.intentAssessment.unexplainedAffectedBrands.length
+    ? { unexplained_affected_brands: assessment.intentAssessment.unexplainedAffectedBrands }
+    : {};
+}
+
 function smokePublishBlockForUser(user) {
   if (!databaseLooksProductionLike()) return null;
   if (!looksLikeSmokePublishActor(user) || smokePublishOverrideAccepted()) return null;
@@ -484,12 +493,13 @@ async function publishSaveAndSendSnapshot(pool, options = {}) {
       currentPublished: currentSnapshot,
       incomingPayload: payload,
       explicitBaseVersion: options.explicitBaseVersion,
+      publishIntent: options.publishIntent,
     });
     if (assessment.block) {
       return {
         blocked: true,
         status: assessment.block.status,
-        body: publishBlockedResponse(assessment.block, assessment),
+        body: publishBlockedResponse(assessment.block, assessment, publishIntentResponseExtras(assessment)),
       };
     }
     const nextVersion = Math.max(1, currentVersion + 1);
@@ -1673,6 +1683,7 @@ async function createApp(options = {}) {
         payload: fallbackPayload,
         actor,
         explicitBaseVersion: req.body && req.body.base_snapshot_version,
+        publishIntent: req.body && req.body.publish_intent,
       });
       if (publishResult && publishResult.blocked) {
         await appendAuditLogEntry(db, {
@@ -1693,6 +1704,10 @@ async function createApp(options = {}) {
             affectedBrands:
               publishResult.body && Array.isArray(publishResult.body.affected_brands)
                 ? publishResult.body.affected_brands
+                : undefined,
+            unexplainedAffectedBrands:
+              publishResult.body && Array.isArray(publishResult.body.unexplained_affected_brands)
+                ? publishResult.body.unexplained_affected_brands
                 : undefined,
           },
         });
@@ -2749,6 +2764,7 @@ async function createApp(options = {}) {
               requestId,
               startedAt,
               explicitBaseVersion: body.base_snapshot_version,
+              publishIntent: body.publish_intent,
             });
             if (publishResult && publishResult.blocked) {
               result = {
@@ -2813,6 +2829,8 @@ async function createApp(options = {}) {
                   : undefined,
               affectedBrands:
                 error && Array.isArray(error.affectedBrands) ? error.affectedBrands : undefined,
+              unexplainedAffectedBrands:
+                error && Array.isArray(error.unexplainedAffectedBrands) ? error.unexplainedAffectedBrands : undefined,
             },
           });
           throw error;
@@ -2837,6 +2855,10 @@ async function createApp(options = {}) {
                   : undefined,
               affectedBrands:
                 result && result.body && Array.isArray(result.body.affected_brands) ? result.body.affected_brands : undefined,
+              unexplainedAffectedBrands:
+                result && result.body && Array.isArray(result.body.unexplained_affected_brands)
+                  ? result.body.unexplained_affected_brands
+                  : undefined,
             },
           });
         }
