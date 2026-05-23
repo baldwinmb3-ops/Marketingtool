@@ -39,6 +39,32 @@ function sanitizeQuoteLines(input) {
     .filter(Boolean);
 }
 
+function hasOwn(obj, key) {
+  return !!obj && Object.prototype.hasOwnProperty.call(obj, key);
+}
+
+function optionalMoney(src, key, fallback = null) {
+  if (hasOwn(src, key)) {
+    const value = src[key];
+    if (value === null || value === undefined || (typeof value === 'string' && !String(value).trim())) return null;
+    return Number(Math.max(0, toNum(value, 0)).toFixed(2));
+  }
+  return fallback;
+}
+
+function optionalInt(src, key, fallback = null) {
+  if (hasOwn(src, key)) {
+    const value = src[key];
+    if (value === null || value === undefined || (typeof value === 'string' && !String(value).trim())) return null;
+    return Math.max(0, toInt(value, 0));
+  }
+  return fallback;
+}
+
+function commissionFromHurdle(hurdleAmount = 0, guestGivebackAmount = 0) {
+  return Number(Math.max(0, Math.max(0, toNum(hurdleAmount, 0)) - Math.max(0, toNum(guestGivebackAmount, 0))).toFixed(2));
+}
+
 function recomputePricing(publishedPayload, quoteLines) {
   const payload = publishedPayload && typeof publishedPayload === 'object' ? publishedPayload : {};
   const sourceLines = Array.isArray(payload.ticketLines) ? payload.ticketLines : [];
@@ -118,6 +144,12 @@ function sanitizeBookingRow(input, defaults = {}) {
     clientTotals: src.clientTotals && typeof src.clientTotals === 'object' ? src.clientTotals : base.clientTotals || {},
     authoritativeTotals: src.authoritativeTotals && typeof src.authoritativeTotals === 'object' ? src.authoritativeTotals : base.authoritativeTotals || {},
     commissionProfit: Number(toNum(src.commissionProfit, toNum(base.commissionProfit, 0)).toFixed(2)),
+    commissionBookedAmount: optionalMoney(src, 'commissionBookedAmount', optionalMoney(base, 'commissionBookedAmount', null)),
+    commissionHurdleAmount: optionalMoney(src, 'commissionHurdleAmount', optionalMoney(base, 'commissionHurdleAmount', null)),
+    commissionHurdleLevelId: String(src.commissionHurdleLevelId || base.commissionHurdleLevelId || '').trim(),
+    commissionHurdleRangeLabel: String(src.commissionHurdleRangeLabel || base.commissionHurdleRangeLabel || '').trim(),
+    commissionHurdleTourCount: optionalInt(src, 'commissionHurdleTourCount', optionalInt(base, 'commissionHurdleTourCount', null)),
+    commissionGuestGivebackAmount: optionalMoney(src, 'commissionGuestGivebackAmount', optionalMoney(base, 'commissionGuestGivebackAmount', null)),
     createdByDevice: String(src.createdByDevice || base.createdByDevice || '').trim(),
     createdByUserId: String(src.createdByUserId || src.created_by_user_id || base.createdByUserId || '').trim(),
     createdByUserEmail: normalizeEmail(src.createdByUserEmail || src.created_by_user_email || base.createdByUserEmail || ''),
@@ -496,9 +528,18 @@ async function upsertBookingRows(db, incomingRequests) {
       const pricing = diagnostics.pricing;
       row.authoritativeTotals = pricing;
       row.commissionProfit = pricing.profit;
+      if (row.commissionHurdleAmount !== null) {
+        row.commissionBookedAmount = commissionFromHurdle(row.commissionHurdleAmount, row.commissionGuestGivebackAmount || 0);
+      }
     } else {
       row.authoritativeTotals = current.authoritativeTotals || {};
       row.commissionProfit = Number(toNum(current.commissionProfit, row.commissionProfit).toFixed(2));
+      row.commissionBookedAmount = optionalMoney(current, 'commissionBookedAmount', row.commissionBookedAmount);
+      row.commissionHurdleAmount = optionalMoney(current, 'commissionHurdleAmount', row.commissionHurdleAmount);
+      row.commissionHurdleLevelId = String(current.commissionHurdleLevelId || row.commissionHurdleLevelId || '').trim();
+      row.commissionHurdleRangeLabel = String(current.commissionHurdleRangeLabel || row.commissionHurdleRangeLabel || '').trim();
+      row.commissionHurdleTourCount = optionalInt(current, 'commissionHurdleTourCount', row.commissionHurdleTourCount);
+      row.commissionGuestGivebackAmount = optionalMoney(current, 'commissionGuestGivebackAmount', row.commissionGuestGivebackAmount);
     }
 
     row.updatedAt = nowIso();

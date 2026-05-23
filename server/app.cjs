@@ -1805,6 +1805,9 @@ async function createApp(options = {}) {
         const stamp = nowIso();
         incoming.authoritativeTotals = pricing;
         incoming.commissionProfit = pricing.profit;
+        if (incoming.commissionHurdleAmount !== null && incoming.commissionHurdleAmount !== undefined) {
+          incoming.commissionBookedAmount = Math.max(0, Number((Number(incoming.commissionHurdleAmount || 0) - Number(incoming.commissionGuestGivebackAmount || 0)).toFixed(2)));
+        }
         incoming.status = 'pending';
         incoming.statusAt = stamp;
         incoming.createdAt = stamp;
