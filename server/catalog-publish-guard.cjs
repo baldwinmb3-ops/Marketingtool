@@ -19,6 +19,39 @@ const PUBLISH_BASE_VERSION_INVALID_MESSAGE =
 const SMOKE_PUBLISH_BLOCKED_CODE = 'SMOKE_PUBLISH_BLOCKED';
 const SMOKE_PUBLISH_BLOCKED_MESSAGE =
   'Smoke-test admin accounts cannot publish the live catalog in production unless explicitly enabled.';
+const SCHEDULED_MIGRATION_INVALID_CODE = 'SCHEDULED_MIGRATION_INVALID';
+const SCHEDULED_MIGRATION_INVALID_MESSAGE =
+  'Scheduled migration blocked because the live catalog no longer matches the verified scheduled-only migration shape.';
+const SCHEDULED_MIGRATION_EXPECTED_BRAND_COUNT = 90;
+const SCHEDULED_MIGRATION_EXPECTED_SCHEDULED_TRUE = 21;
+const SCHEDULED_MIGRATION_EXPECTED_SCHEDULED_FALSE = 69;
+const SCHEDULED_MIGRATION_KEY_BRANDS = Object.freeze([
+  {
+    id: '',
+    name: 'Myrtle Waves GA',
+    expectedScheduled: false,
+    expectedShowInCalendar: true,
+    expectedBookingRequired: false,
+  },
+  {
+    id: 'brand-medieval-times',
+    name: 'Medieval Times',
+    expectedScheduled: true,
+    expectedShowInCalendar: true,
+  },
+  {
+    id: 'brand-att-barefoot-queen-dinner-cruise',
+    name: 'Barefoot Queen Riverboat Dinner Cruise',
+    expectedScheduled: true,
+    expectedShowInCalendar: false,
+  },
+  {
+    id: 'brand-att-barefoot-queen-sightseeing-cruise',
+    name: 'Barefoot Queen Riverboat Sightseeing Cruise',
+    expectedScheduled: true,
+    expectedShowInCalendar: false,
+  },
+]);
 
 function normalizeDateKey(value) {
   const dateKey = String(value || '').trim();
@@ -40,6 +73,22 @@ function normalizeStatusValue(value) {
 
 function uniqueSortedStrings(values) {
   return Array.from(new Set((Array.isArray(values) ? values : []).filter(Boolean))).sort();
+}
+
+function deepClone(value) {
+  return JSON.parse(JSON.stringify(value && typeof value === 'object' ? value : {}));
+}
+
+function stableJson(value) {
+  try {
+    return JSON.stringify(value);
+  } catch (_err) {
+    return '__non_json__';
+  }
+}
+
+function valuesDiffer(left, right) {
+  return stableJson(left) !== stableJson(right);
 }
 
 function normalizeScheduleDates(raw) {
@@ -83,6 +132,45 @@ function normalizeScheduleWeekly(raw) {
     if (cleanTimes.length) out[dayKey] = cleanTimes;
   }
   return out;
+}
+
+function normalizeCategoryKey(value) {
+  return String(value || '').trim().toLowerCase();
+}
+
+function isShowCategory(category) {
+  const key = normalizeCategoryKey(category);
+  return key === 'shows' || key === 'attractions' || key === 'ga attractions';
+}
+
+function isShowsFolderCategory(category) {
+  return normalizeCategoryKey(category) === 'shows';
+}
+
+function bookingIsLegacyScheduledAttractionBrandId(brandId = '') {
+  const key = String(brandId || '').trim();
+  return key === 'brand-att-barefoot-queen-dinner-cruise' || key === 'brand-att-barefoot-queen-sightseeing-cruise';
+}
+
+function brandHasScheduleTimes(brand) {
+  const dates = normalizeScheduleDates(brand && brand.showScheduleDates);
+  if (Object.keys(dates).some((dateKey) => Array.isArray(dates[dateKey]) && dates[dateKey].length > 0)) return true;
+  const weekly = normalizeScheduleWeekly(brand && brand.showScheduleWeekly);
+  return Object.keys(weekly).some((dayKey) => Array.isArray(weekly[dayKey]) && weekly[dayKey].length > 0);
+}
+
+function scheduledFlagFromLegacyBrand(brand) {
+  const row = brand && typeof brand === 'object' ? brand : {};
+  if (!isShowCategory(row.category)) return false;
+  if (isShowsFolderCategory(row.category)) return true;
+  if (bookingIsLegacyScheduledAttractionBrandId(row.id)) return true;
+  return brandHasScheduleTimes(row);
+}
+
+function brandDerivedScheduledValue(brand) {
+  const row = brand && typeof brand === 'object' ? brand : {};
+  if (typeof row.scheduled === 'boolean') return !!row.scheduled;
+  return scheduledFlagFromLegacyBrand(row);
 }
 
 function normalizeScheduleSlotKey(value) {
@@ -471,6 +559,244 @@ function assessCatalogPublishSafety(options = {}) {
   };
 }
 
+function buildBrandMap(rows) {
+  const map = new Map();
+  for (const entry of Array.isArray(rows) ? rows : []) {
+    const row = entry && typeof entry === 'object' ? entry : null;
+    if (!row) continue;
+    const id = String(row.id || '').trim();
+    if (!id) continue;
+    map.set(id, row);
+  }
+  return map;
+}
+
+function changedKeysForBrand(beforeBrand, afterBrand) {
+  const before = beforeBrand && typeof beforeBrand === 'object' ? beforeBrand : {};
+  const after = afterBrand && typeof afterBrand === 'object' ? afterBrand : {};
+  const keys = new Set([...Object.keys(before), ...Object.keys(after)]);
+  return Array.from(keys).filter((key) => valuesDiffer(before[key], after[key])).sort();
+}
+
+function buildCollectionDiffSummary(beforeRows, afterRows, priceKeys = []) {
+  const beforeMap = buildBrandMap(beforeRows);
+  const afterMap = buildBrandMap(afterRows);
+  const ids = new Set([...beforeMap.keys(), ...afterMap.keys()]);
+  let changedRows = 0;
+  let priceDiffs = 0;
+  for (const id of ids) {
+    const before = beforeMap.get(id) || null;
+    const after = afterMap.get(id) || null;
+    if (!before || !after) {
+      changedRows += 1;
+      continue;
+    }
+    const changedKeys = changedKeysForBrand(before, after);
+    if (changedKeys.length) {
+      changedRows += 1;
+      priceDiffs += changedKeys.filter((key) => priceKeys.includes(key)).length;
+    }
+  }
+  return { changedRows, priceDiffs };
+}
+
+function findBrandByKey(rows, keyBrand) {
+  const source = Array.isArray(rows) ? rows : [];
+  if (keyBrand && keyBrand.id) {
+    const foundById = source.find((row) => String((row && row.id) || '').trim() === String(keyBrand.id || '').trim());
+    if (foundById) return foundById;
+  }
+  return source.find((row) => String((row && row.name) || '').trim() === String((keyBrand && keyBrand.name) || '').trim()) || null;
+}
+
+function buildScheduledMigrationKeyBrandSummary(rows) {
+  const brands = Array.isArray(rows) ? rows : [];
+  return SCHEDULED_MIGRATION_KEY_BRANDS.map((keyBrand) => {
+    const row = findBrandByKey(brands, keyBrand);
+    return {
+      id: row ? String(row.id || '') : String(keyBrand.id || ''),
+      name: row ? String(row.name || '') : String(keyBrand.name || ''),
+      found: !!row,
+      scheduled: row && typeof row.scheduled === 'boolean' ? !!row.scheduled : null,
+      showInCalendar: row && typeof row.showInCalendar === 'boolean' ? !!row.showInCalendar : null,
+      bookingRequired: row && typeof row.bookingRequired === 'boolean' ? !!row.bookingRequired : null,
+    };
+  });
+}
+
+function buildScheduledMigrationSummary(beforePayload, afterPayload) {
+  const before = beforePayload && typeof beforePayload === 'object' ? beforePayload : {};
+  const after = afterPayload && typeof afterPayload === 'object' ? afterPayload : {};
+  const beforeBrands = Array.isArray(before.brands) ? before.brands : [];
+  const afterBrands = Array.isArray(after.brands) ? after.brands : [];
+  const beforeMap = buildBrandMap(beforeBrands);
+  const afterMap = buildBrandMap(afterBrands);
+  const ids = new Set([...beforeMap.keys(), ...afterMap.keys()]);
+  const changedBrands = [];
+  let scheduledOnly = 0;
+  let nonScheduledCount = 0;
+  let showInCalendarDiffs = 0;
+  let bookingRequiredDiffs = 0;
+  let categoryDiffs = 0;
+  let showScheduleDatesDiffs = 0;
+  let showScheduleStatusDiffs = 0;
+  let showAlertHistoryDiffs = 0;
+  let showUpdateAlertDiffs = 0;
+
+  for (const id of ids) {
+    const beforeBrand = beforeMap.get(id) || null;
+    const afterBrand = afterMap.get(id) || null;
+    const diffKeys = changedKeysForBrand(beforeBrand, afterBrand);
+    if (!diffKeys.length) continue;
+    const name = String((afterBrand && afterBrand.name) || (beforeBrand && beforeBrand.name) || id).trim() || id;
+    changedBrands.push({ id, name, diffKeys });
+    if (diffKeys.length === 1 && diffKeys[0] === 'scheduled') {
+      scheduledOnly += 1;
+    } else {
+      nonScheduledCount += 1;
+    }
+    if (diffKeys.includes('showInCalendar')) showInCalendarDiffs += 1;
+    if (diffKeys.includes('bookingRequired')) bookingRequiredDiffs += 1;
+    if (diffKeys.includes('category')) categoryDiffs += 1;
+    if (diffKeys.includes('showScheduleDates')) showScheduleDatesDiffs += 1;
+    if (diffKeys.includes('showScheduleStatus')) showScheduleStatusDiffs += 1;
+    if (diffKeys.includes('showAlertHistory')) showAlertHistoryDiffs += 1;
+    if (diffKeys.includes('showUpdateAlert')) showUpdateAlertDiffs += 1;
+  }
+
+  const ticketLineDiff = buildCollectionDiffSummary(before.ticketLines, after.ticketLines, ['retailPrice', 'cmaPrice']);
+  const resourceDiff = buildCollectionDiffSummary(before.resources, after.resources);
+  const scheduledTrueBrandNames = afterBrands
+    .filter((row) => row && row.scheduled === true)
+    .map((row) => String(row.name || '').trim())
+    .filter(Boolean)
+    .sort((a, b) => a.localeCompare(b));
+  const scheduledFalseBrandNames = afterBrands
+    .filter((row) => row && row.scheduled === false)
+    .map((row) => String(row.name || '').trim())
+    .filter(Boolean)
+    .sort((a, b) => a.localeCompare(b));
+
+  return {
+    brandCount: beforeBrands.length,
+    scheduledMissingBefore: beforeBrands.filter((row) => !(row && typeof row.scheduled === 'boolean')).length,
+    changedBrands: changedBrands.length,
+    scheduledOnly,
+    nonScheduledCount,
+    scheduledTrueCount: scheduledTrueBrandNames.length,
+    scheduledFalseCount: scheduledFalseBrandNames.length,
+    showInCalendarDiffs,
+    bookingRequiredDiffs,
+    categoryDiffs,
+    ticketLineDiffs: ticketLineDiff.changedRows,
+    priceDiffs: ticketLineDiff.priceDiffs,
+    resourceDiffs: resourceDiff.changedRows,
+    showScheduleDatesDiffs,
+    showScheduleStatusDiffs,
+    showAlertHistoryDiffs,
+    showUpdateAlertDiffs,
+    scheduleAlertDiffs: showScheduleDatesDiffs + showScheduleStatusDiffs + showAlertHistoryDiffs + showUpdateAlertDiffs,
+    scheduledTrueBrandNames,
+    scheduledFalseBrandNames,
+    changedBrandIds: changedBrands.map((entry) => entry.id),
+    changedBrandNames: changedBrands.map((entry) => entry.name),
+    keyBrands: buildScheduledMigrationKeyBrandSummary(afterBrands),
+  };
+}
+
+function validateScheduledMigrationSummary(summary) {
+  const s = summary && typeof summary === 'object' ? summary : {};
+  const errors = [];
+  if (Number(s.brandCount || 0) !== SCHEDULED_MIGRATION_EXPECTED_BRAND_COUNT) {
+    errors.push(`Expected ${SCHEDULED_MIGRATION_EXPECTED_BRAND_COUNT} brands, found ${Number(s.brandCount || 0)}.`);
+  }
+  if (Number(s.scheduledMissingBefore || 0) !== SCHEDULED_MIGRATION_EXPECTED_BRAND_COUNT) {
+    errors.push(`Expected ${SCHEDULED_MIGRATION_EXPECTED_BRAND_COUNT} brands with scheduled missing before apply, found ${Number(s.scheduledMissingBefore || 0)}.`);
+  }
+  if (Number(s.changedBrands || 0) !== SCHEDULED_MIGRATION_EXPECTED_BRAND_COUNT) {
+    errors.push(`Expected ${SCHEDULED_MIGRATION_EXPECTED_BRAND_COUNT} changed brands, found ${Number(s.changedBrands || 0)}.`);
+  }
+  if (Number(s.scheduledOnly || 0) !== SCHEDULED_MIGRATION_EXPECTED_BRAND_COUNT) {
+    errors.push(`Expected ${SCHEDULED_MIGRATION_EXPECTED_BRAND_COUNT} scheduled-only brand diffs, found ${Number(s.scheduledOnly || 0)}.`);
+  }
+  if (Number(s.nonScheduledCount || 0) !== 0) {
+    errors.push(`Expected 0 non-scheduled diffs, found ${Number(s.nonScheduledCount || 0)}.`);
+  }
+  if (Number(s.scheduledTrueCount || 0) !== SCHEDULED_MIGRATION_EXPECTED_SCHEDULED_TRUE) {
+    errors.push(`Expected ${SCHEDULED_MIGRATION_EXPECTED_SCHEDULED_TRUE} scheduled=true brands, found ${Number(s.scheduledTrueCount || 0)}.`);
+  }
+  if (Number(s.scheduledFalseCount || 0) !== SCHEDULED_MIGRATION_EXPECTED_SCHEDULED_FALSE) {
+    errors.push(`Expected ${SCHEDULED_MIGRATION_EXPECTED_SCHEDULED_FALSE} scheduled=false brands, found ${Number(s.scheduledFalseCount || 0)}.`);
+  }
+  [
+    ['showInCalendarDiffs', 0],
+    ['bookingRequiredDiffs', 0],
+    ['categoryDiffs', 0],
+    ['ticketLineDiffs', 0],
+    ['priceDiffs', 0],
+    ['resourceDiffs', 0],
+    ['showScheduleDatesDiffs', 0],
+    ['showScheduleStatusDiffs', 0],
+    ['showAlertHistoryDiffs', 0],
+    ['showUpdateAlertDiffs', 0],
+    ['scheduleAlertDiffs', 0],
+  ].forEach(([key, expected]) => {
+    if (Number(s[key] || 0) !== expected) {
+      errors.push(`Expected ${key}=${expected}, found ${Number(s[key] || 0)}.`);
+    }
+  });
+  const keyBrands = Array.isArray(s.keyBrands) ? s.keyBrands : [];
+  SCHEDULED_MIGRATION_KEY_BRANDS.forEach((expectedBrand) => {
+    const found = keyBrands.find((entry) => {
+      if (expectedBrand.id && String((entry && entry.id) || '').trim() === expectedBrand.id) return true;
+      return String((entry && entry.name) || '').trim() === expectedBrand.name;
+    }) || null;
+    if (!found || !found.found) {
+      errors.push(`Expected key brand ${expectedBrand.name} in the migration preview.`);
+      return;
+    }
+    if (typeof expectedBrand.expectedScheduled === 'boolean' && found.scheduled !== expectedBrand.expectedScheduled) {
+      errors.push(`Expected ${expectedBrand.name} scheduled=${String(expectedBrand.expectedScheduled)}, found ${String(found.scheduled)}.`);
+    }
+    if (typeof expectedBrand.expectedShowInCalendar === 'boolean' && found.showInCalendar !== expectedBrand.expectedShowInCalendar) {
+      errors.push(`Expected ${expectedBrand.name} showInCalendar=${String(expectedBrand.expectedShowInCalendar)}, found ${String(found.showInCalendar)}.`);
+    }
+    if (typeof expectedBrand.expectedBookingRequired === 'boolean' && found.bookingRequired !== expectedBrand.expectedBookingRequired) {
+      errors.push(`Expected ${expectedBrand.name} bookingRequired=${String(expectedBrand.expectedBookingRequired)}, found ${String(found.bookingRequired)}.`);
+    }
+  });
+  return {
+    ok: errors.length === 0,
+    errors,
+  };
+}
+
+function deriveScheduledMigrationPayload(publishedPayload, opts = {}) {
+  const options = opts && typeof opts === 'object' ? opts : {};
+  const current = deepClone(publishedPayload && typeof publishedPayload === 'object' ? publishedPayload : {});
+  current.brands = Array.isArray(current.brands) ? current.brands : [];
+  current.ticketLines = Array.isArray(current.ticketLines) ? current.ticketLines : [];
+  current.resources = Array.isArray(current.resources) ? current.resources : [];
+  let migrated = deepClone(current);
+  migrated.brands = current.brands.map((brand) => {
+    const row = brand && typeof brand === 'object' ? deepClone(brand) : {};
+    if (typeof row.scheduled === 'boolean') return row;
+    row.scheduled = brandDerivedScheduledValue(row);
+    return row;
+  });
+  if (typeof options.finalizePayload === 'function') {
+    migrated = deepClone(options.finalizePayload(migrated));
+  }
+  const summary = buildScheduledMigrationSummary(current, migrated);
+  const validation = validateScheduledMigrationSummary(summary);
+  return {
+    currentPayload: current,
+    migratedPayload: migrated,
+    summary,
+    validation,
+  };
+}
+
 function buildRecoveryConfirmationToken(sourceVersion, target = 'published') {
   const safeVersion = Math.max(1, toInt(sourceVersion, 0));
   const safeTarget = String(target || 'published').trim().toLowerCase() === 'draft' ? 'draft' : 'published';
@@ -518,11 +844,16 @@ module.exports = {
   PUBLISH_BASE_VERSION_INVALID_MESSAGE,
   SMOKE_PUBLISH_BLOCKED_CODE,
   SMOKE_PUBLISH_BLOCKED_MESSAGE,
+  SCHEDULED_MIGRATION_INVALID_CODE,
+  SCHEDULED_MIGRATION_INVALID_MESSAGE,
   SMOKE_PUBLISH_OVERRIDE_ENV,
   normalizeScheduleDates,
   normalizeScheduleStatus,
   normalizeScheduleWeekly,
+  brandDerivedScheduledValue,
   buildCatalogScheduleSummary,
+  buildScheduledMigrationSummary,
+  deriveScheduledMigrationPayload,
   diffCatalogScheduleImpact,
   extractCatalogBaseVersion,
   assessCatalogPublishSafety,
@@ -530,4 +861,5 @@ module.exports = {
   smokePublishOverrideAccepted,
   looksLikeSmokePublishActor,
   isPrimaryAdminUser,
+  validateScheduledMigrationSummary,
 };

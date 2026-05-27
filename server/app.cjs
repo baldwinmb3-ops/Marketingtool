@@ -43,15 +43,25 @@ const { deriveAccess, buildSessionPayload } = require('./authz.cjs');
 const { latestValidatedBackup } = require('./backup-safety.cjs');
 const { databaseLooksProductionLike } = require('./db-safety.cjs');
 const {
+  PUBLISH_BASE_VERSION_REQUIRED_CODE,
+  PUBLISH_BASE_VERSION_REQUIRED_MESSAGE,
+  PUBLISH_BASE_VERSION_STALE_CODE,
+  PUBLISH_BASE_VERSION_STALE_MESSAGE,
+  PUBLISH_BASE_VERSION_INVALID_CODE,
+  PUBLISH_BASE_VERSION_INVALID_MESSAGE,
   SMOKE_PUBLISH_BLOCKED_CODE,
   SMOKE_PUBLISH_BLOCKED_MESSAGE,
+  SCHEDULED_MIGRATION_INVALID_CODE,
+  SCHEDULED_MIGRATION_INVALID_MESSAGE,
   assessCatalogPublishSafety,
   buildCatalogScheduleSummary,
   buildRecoveryConfirmationToken,
+  deriveScheduledMigrationPayload,
   diffCatalogScheduleImpact,
   looksLikeSmokePublishActor,
   isPrimaryAdminUser,
   smokePublishOverrideAccepted,
+  validateScheduledMigrationSummary,
 } = require('./catalog-publish-guard.cjs');
 const {
   sanitizeCatalogPayload,
@@ -351,6 +361,63 @@ function smokePublishBlockForUser(user) {
     code: SMOKE_PUBLISH_BLOCKED_CODE,
     message: SMOKE_PUBLISH_BLOCKED_MESSAGE,
   };
+}
+
+function scheduledMigrationBlockedResponse(block, extras = {}) {
+  return {
+    ok: false,
+    code: String((block && block.code) || SCHEDULED_MIGRATION_INVALID_CODE).trim() || SCHEDULED_MIGRATION_INVALID_CODE,
+    message:
+      String((block && block.message) || SCHEDULED_MIGRATION_INVALID_MESSAGE).trim() || SCHEDULED_MIGRATION_INVALID_MESSAGE,
+    ...extras,
+  };
+}
+
+function scheduledMigrationPreviewResponse(currentPublished, migration, messageOverride = '') {
+  const version = Math.max(0, toInt(currentPublished && currentPublished.version, 0));
+  const summary = migration && migration.summary && typeof migration.summary === 'object' ? migration.summary : {};
+  const validation = migration && migration.validation && typeof migration.validation === 'object' ? migration.validation : { ok: false, errors: [] };
+  return {
+    ok: true,
+    message:
+      String(messageOverride || (validation.ok ? 'Scheduled migration preview ready.' : 'Scheduled migration preview loaded with blockers.')).trim() ||
+      (validation.ok ? 'Scheduled migration preview ready.' : 'Scheduled migration preview loaded with blockers.'),
+    base_snapshot_version: version,
+    published_snapshot_version: version,
+    summary,
+    key_brands: Array.isArray(summary.keyBrands) ? summary.keyBrands : [],
+    ready_to_apply: !!validation.ok,
+    validation_errors: Array.isArray(validation.errors) ? validation.errors : [],
+  };
+}
+
+function scheduledMigrationAuthBlock(req) {
+  const permissions = req && req.auth && req.auth.payload && req.auth.payload.permissions ? req.auth.payload.permissions : {};
+  if (!permissions.publish_catalog) {
+    return {
+      status: 403,
+      body: { ok: false, code: 'FORBIDDEN', message: 'Only admins can publish snapshots.' },
+    };
+  }
+  const actorUser = req && req.auth ? req.auth.user : null;
+  const smokeBlock = smokePublishBlockForUser(actorUser);
+  if (smokeBlock) {
+    return {
+      status: smokeBlock.status,
+      body: { ok: false, code: smokeBlock.code, message: smokeBlock.message },
+    };
+  }
+  if (!isPrimaryAdminUser(actorUser)) {
+    return {
+      status: 403,
+      body: {
+        ok: false,
+        code: 'PRIMARY_ADMIN_REQUIRED',
+        message: 'Only Primary Admin can run the scheduled migration.',
+      },
+    };
+  }
+  return null;
 }
 
 function normalizeRecoveryTarget(value) {
@@ -2710,6 +2777,197 @@ async function createApp(options = {}) {
           return { status: 200, body: { ok: true, message: 'Booking ownership cleared.' } };
         });
         res.status((manageResponse && manageResponse.status) || 500).json((manageResponse && manageResponse.body) || { ok: false, message: 'Booking action failed.' });
+        return;
+      }
+      if (action === 'catalog_preview_scheduled_migration') {
+        const authBlock = scheduledMigrationAuthBlock(req);
+        if (authBlock) {
+          res.status(authBlock.status).json(authBlock.body);
+          return;
+        }
+        const currentPublished = await readSnapshotStage(db, 'published');
+        if (!(currentPublished && currentPublished.payload)) {
+          res.status(404).json({
+            ok: false,
+            code: 'CATALOG_PUBLISHED_NOT_FOUND',
+            message: 'No published cloud snapshot found.',
+          });
+          return;
+        }
+        const migration = deriveScheduledMigrationPayload(currentPublished.payload, {
+          finalizePayload: sanitizeCatalogPayload,
+        });
+        res.status(200).json(scheduledMigrationPreviewResponse(currentPublished, migration));
+        return;
+      }
+      if (action === 'catalog_apply_scheduled_migration') {
+        const authBlock = scheduledMigrationAuthBlock(req);
+        if (authBlock) {
+          res.status(authBlock.status).json(authBlock.body);
+          return;
+        }
+        const requestId = normalizeCloudRequestId(body.request_id || randomId('request'));
+        const baseVersion = Math.max(0, toInt(body.base_snapshot_version, 0));
+        if (baseVersion <= 0) {
+          res.status(409).json(
+            scheduledMigrationBlockedResponse(
+              { code: PUBLISH_BASE_VERSION_REQUIRED_CODE, message: PUBLISH_BASE_VERSION_REQUIRED_MESSAGE },
+              {
+                current_published_version: 0,
+                base_snapshot_version: 0,
+                validation_errors: [PUBLISH_BASE_VERSION_REQUIRED_MESSAGE],
+              },
+            ),
+          );
+          return;
+        }
+        const publishStatus = await readSaveAndSendStatus(db, requestId);
+        if (publishStatus.status === 'confirmed_success' || publishStatus.status === 'pending_confirmation') {
+          res.status(saveAndSendStatusHttpStatus(publishStatus.status)).json(publishStatus);
+          return;
+        }
+        const currentPublished = await readSnapshotStage(db, 'published');
+        if (!(currentPublished && currentPublished.payload)) {
+          res.status(404).json({
+            ok: false,
+            code: 'CATALOG_PUBLISHED_NOT_FOUND',
+            message: 'No published cloud snapshot found.',
+          });
+          return;
+        }
+        const currentVersion = Math.max(0, toInt(currentPublished.version, 0));
+        if (baseVersion < currentVersion) {
+          res.status(409).json(
+            scheduledMigrationBlockedResponse(
+              { code: PUBLISH_BASE_VERSION_STALE_CODE, message: PUBLISH_BASE_VERSION_STALE_MESSAGE },
+              {
+                current_published_version: currentVersion,
+                base_snapshot_version: baseVersion,
+                validation_errors: [PUBLISH_BASE_VERSION_STALE_MESSAGE],
+              },
+            ),
+          );
+          return;
+        }
+        if (baseVersion > currentVersion) {
+          res.status(409).json(
+            scheduledMigrationBlockedResponse(
+              { code: PUBLISH_BASE_VERSION_INVALID_CODE, message: PUBLISH_BASE_VERSION_INVALID_MESSAGE },
+              {
+                current_published_version: currentVersion,
+                base_snapshot_version: baseVersion,
+                validation_errors: [PUBLISH_BASE_VERSION_INVALID_MESSAGE],
+              },
+            ),
+          );
+          return;
+        }
+        const migration = deriveScheduledMigrationPayload(currentPublished.payload, {
+          finalizePayload: sanitizeCatalogPayload,
+        });
+        const previewPayload = scheduledMigrationPreviewResponse(currentPublished, migration);
+        if (!migration.validation.ok) {
+          res.status(409).json(
+            scheduledMigrationBlockedResponse(
+              { code: SCHEDULED_MIGRATION_INVALID_CODE, message: SCHEDULED_MIGRATION_INVALID_MESSAGE },
+              {
+                current_published_version: currentVersion,
+                base_snapshot_version: baseVersion,
+                migration_preview: previewPayload,
+                validation_errors: Array.isArray(migration.validation.errors) ? migration.validation.errors : [],
+              },
+            ),
+          );
+          return;
+        }
+        const actor = { userId: req.auth.user.id, name: req.auth.user.displayName };
+        const startedMarker = await createSaveAndSendStartedMarker(db, {
+          requestId,
+          actorUserId: actor.userId,
+          actorName: actor.name,
+        });
+        const startedAt = startedMarker.startedAt;
+        let result = null;
+        try {
+          const publishResult = await publishSaveAndSendSnapshot(db, {
+            payload: migration.migratedPayload,
+            userOps: [],
+            actor,
+            requestId,
+            startedAt,
+            explicitBaseVersion: baseVersion,
+          });
+          if (publishResult && publishResult.blocked) {
+            result = {
+              status: publishResult.status,
+              body: publishResult.body,
+            };
+          } else {
+            await appendAuditLogEntry(db, {
+              action: SAVE_AND_SEND_AUDIT_ACTION_SUCCESS,
+              actorUserId: actor.userId,
+              actorName: actor.name,
+              targetType: 'snapshot',
+              targetId: String(publishResult.version),
+              details: {
+                requestId,
+                startedAt,
+                version: publishResult.version,
+                publishedAt: publishResult.publishedAt,
+                userOperations: 0,
+                message: 'Scheduled migration published.',
+              },
+            });
+            result = {
+              status: 200,
+              body: {
+                ok: true,
+                request_id: requestId,
+                message: 'Scheduled migration published.',
+                published_snapshot_version_before: currentVersion,
+                published_snapshot_version_after: publishResult.version,
+                published_at: publishResult.publishedAt,
+                applied_preview: previewPayload,
+                migration_preview: previewPayload,
+              },
+            };
+          }
+        } catch (error) {
+          await appendAuditLogEntry(db, {
+            action: SAVE_AND_SEND_AUDIT_ACTION_FAILED,
+            actorUserId: req.auth && req.auth.user ? req.auth.user.id : '',
+            actorName: req.auth && req.auth.user ? req.auth.user.displayName : '',
+            targetType: 'snapshot',
+            targetId: requestId,
+            details: {
+              requestId,
+              startedAt,
+              code: String((error && error.code) || '').trim(),
+              message: String((error && error.message) || 'Scheduled migration apply failed.').trim() || 'Scheduled migration apply failed.',
+              currentVersion: Math.max(0, toInt(error && error.currentVersion, 0)),
+              baseVersion: Math.max(0, toInt(error && error.baseVersion, 0)),
+            },
+          });
+          throw error;
+        }
+        if (!(result && result.status >= 200 && result.status < 300 && result.body && result.body.ok)) {
+          await appendAuditLogEntry(db, {
+            action: SAVE_AND_SEND_AUDIT_ACTION_FAILED,
+            actorUserId: req.auth && req.auth.user ? req.auth.user.id : '',
+            actorName: req.auth && req.auth.user ? req.auth.user.displayName : '',
+            targetType: 'snapshot',
+            targetId: requestId,
+            details: {
+              requestId,
+              startedAt,
+              code: String((result && result.body && result.body.code) || '').trim(),
+              message: String((result && result.body && result.body.message) || 'Scheduled migration apply failed.').trim() || 'Scheduled migration apply failed.',
+              currentVersion: Math.max(0, toInt(result && result.body && result.body.current_published_version, 0)),
+              baseVersion: Math.max(0, toInt(result && result.body && result.body.base_snapshot_version, 0)),
+            },
+          });
+        }
+        res.status(result.status || 200).json(result.body || { ok: false, message: 'Scheduled migration apply failed.' });
         return;
       }
       if (action === 'save_and_send') {
