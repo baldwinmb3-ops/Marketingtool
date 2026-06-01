@@ -74,6 +74,10 @@ const {
   applyUserOperation,
   upsertBookingRows,
 } = require('./domain.cjs');
+const {
+  observeRoute: observePilotReadinessRoute,
+  snapshotPilotReadinessDiagnostics,
+} = require('./pilot-readiness-diagnostics.cjs');
 
 const SESSION_COOKIE = 'mt_session';
 const DEFAULT_SESSION_TTL_MS = 1000 * 60 * 60 * 12;
@@ -97,6 +101,31 @@ function extractSessionIdFromRequest(req) {
   const headerSession = String((req.headers && req.headers['x-session-id']) || '').trim();
   if (headerSession) return headerSession;
 
+  return '';
+}
+
+function measurePilotReadiness(key) {
+  return (_req, res, next) => {
+    observePilotReadinessRoute(key, res);
+    next();
+  };
+}
+
+function pilotReadinessCloudActionKey(action) {
+  const normalizedAction = String(action || '').trim().toLowerCase();
+  if (normalizedAction === 'catalog_get_live') return 'POST /api/cloud action=catalog_get_live';
+  if (normalizedAction === 'booking_get') return 'POST /api/cloud action=booking_get';
+  if (normalizedAction === 'booking_save') return 'POST /api/cloud action=booking_save';
+  if (normalizedAction === 'save_and_send') return 'POST /api/cloud action=save_and_send';
+  return '';
+}
+
+function normalizeSessionTransport(value) {
+  const raw = String(value || '').trim().toLowerCase();
+  if (!raw) return '';
+  if (raw === 'cookie') return 'cookie';
+  if (['bearer', 'authorization', 'auth', 'cookie_or_bearer', 'cookie-or-bearer'].includes(raw)) return 'bearer';
+  if (['x-session-id', 'session-id', 'header'].includes(raw)) return 'x-session-id';
   return '';
 }
 
@@ -1497,7 +1526,7 @@ async function createApp(options = {}) {
     res.json({ ok: true, service: 'marketingtool-backend', at: nowIso(), version: appVersion, runtime: runtimeSnapshot() });
   });
 
-  app.get('/api/users', requireSession, async (req, res, next) => {
+  app.get('/api/users', measurePilotReadiness('GET /api/users'), requireSession, async (req, res, next) => {
     try {
       const permissions = requestPermissions(req);
       const activeRole = requestActiveRole(req);
@@ -1521,7 +1550,7 @@ async function createApp(options = {}) {
     }
   });
 
-  app.get('/api/managers/on-duty', requireSession, requirePermission('view_catalog'), async (req, res, next) => {
+  app.get('/api/managers/on-duty', measurePilotReadiness('GET /api/managers/on-duty'), requireSession, requirePermission('view_catalog'), async (req, res, next) => {
     try {
       const actorDepartments = req && req.auth && req.auth.user ? req.auth.user.departmentIds : [];
       const [users, onDutyRows] = await Promise.all([listUsers(db), listOnDutyManagerUsers(db)]);
@@ -1549,6 +1578,16 @@ async function createApp(options = {}) {
       next(error);
     }
   });
+
+  app.get(
+    '/api/diagnostics/pilot-readiness',
+    measurePilotReadiness('GET /api/diagnostics/pilot-readiness'),
+    requireSession,
+    requirePermission('manage_admin_updates'),
+    (_req, res) => {
+      res.json({ ok: true, diagnostics: snapshotPilotReadinessDiagnostics() });
+    },
+  );
 
   app.post('/api/managers/duty', requireSession, requirePermission('punch_in'), async (req, res, next) => {
     try {
@@ -1814,7 +1853,7 @@ async function createApp(options = {}) {
       next(error);
     }
   });
-  app.get('/api/bookings', requireSession, async (_req, res) => {
+  app.get('/api/bookings', measurePilotReadiness('GET /api/bookings'), requireSession, async (_req, res) => {
     const state = await readDb(db);
     const rows = Array.isArray(state.bookings)
       ? state.bookings.filter((row) => bookingStatus(row.status) !== 'deleted')
@@ -1822,7 +1861,7 @@ async function createApp(options = {}) {
     res.json({ ok: true, bookings: rows });
   });
 
-  app.post('/api/bookings', requireSession, requirePermission('booking_create'), async (req, res, next) => {
+  app.post('/api/bookings', measurePilotReadiness('POST /api/bookings'), requireSession, requirePermission('booking_create'), async (req, res, next) => {
     try {
       const incoming = sanitizeBookingRow(req.body || {}, {});
       const actorUserId = String((req.auth && req.auth.user && req.auth.user.id) || '').trim();
@@ -1940,7 +1979,7 @@ async function createApp(options = {}) {
     }
   });
 
-  app.post('/api/bookings/:id/claim', requireSession, requirePermission('booking_manage'), async (req, res, next) => {
+  app.post('/api/bookings/:id/claim', measurePilotReadiness('POST /api/bookings/:id/claim'), requireSession, requirePermission('booking_manage'), async (req, res, next) => {
     try {
       const claimResponse = await withDb(db, async (db) => {
         const bookingId = String(req.params.id || '').trim();
@@ -1998,7 +2037,7 @@ async function createApp(options = {}) {
     }
   });
 
-  app.post('/api/bookings/:id/complete', requireSession, requirePermission('booking_manage'), async (req, res, next) => {
+  app.post('/api/bookings/:id/complete', measurePilotReadiness('POST /api/bookings/:id/complete'), requireSession, requirePermission('booking_manage'), async (req, res, next) => {
     try {
       const completeResponse = await withDb(db, async (db) => {
         const bookingId = String(req.params.id || '').trim();
@@ -2056,7 +2095,7 @@ async function createApp(options = {}) {
     }
   });
 
-  app.post('/api/bookings/:id/release', requireSession, requirePermission('booking_manage'), async (req, res, next) => {
+  app.post('/api/bookings/:id/release', measurePilotReadiness('POST /api/bookings/:id/release'), requireSession, requirePermission('booking_manage'), async (req, res, next) => {
     try {
       const releaseResponse = await withDb(db, async (db) => {
         const bookingId = String(req.params.id || '').trim();
@@ -2118,6 +2157,10 @@ async function createApp(options = {}) {
       const body = req.body && typeof req.body === 'object' ? req.body : {};
       const actionRaw = String(body.action || '').trim().toLowerCase();
       const action = actionRaw === 'save_and_sync' ? 'save_and_send' : actionRaw;
+      const pilotReadinessKey = pilotReadinessCloudActionKey(action);
+      if (pilotReadinessKey) {
+        observePilotReadinessRoute(pilotReadinessKey, res);
+      }
 
       if (action === 'health_check') {
         res.json({ ok: true, configured: true, message: 'Cloud API reachable.' });

@@ -13,6 +13,10 @@ const {
   randomId,
 } = require('./lib.cjs');
 const { shouldSeedOnBoot } = require('./db-safety.cjs');
+const {
+  recordSessionLookup,
+  recordSessionRowUpdate,
+} = require('./pilot-readiness-diagnostics.cjs');
 
 const MIGRATION_SQL_PATH = path.join(__dirname, 'sql', '001_init.sql');
 const MIGRATION_SQL = fs.readFileSync(MIGRATION_SQL_PATH, 'utf8');
@@ -1279,6 +1283,7 @@ async function createSessionRecord(pool, options = {}) {
 async function getSessionRecord(pool, sessionId, options = {}) {
   const id = String(sessionId || '').trim();
   if (!id) return null;
+  recordSessionLookup();
   const cached = getCachedSessionRecord(pool, id);
   if (cached) return cached;
   const ttlMs = Math.max(60_000, Number.parseInt(String(options.ttlMs || 0), 10) || 1000 * 60 * 60 * 12);
@@ -1324,6 +1329,7 @@ async function getSessionRecord(pool, sessionId, options = {}) {
       const nextExpiresAt = new Date(nowMs + ttlMs).toISOString();
       const lastSeenAt = new Date(nowMs).toISOString();
       await client.query('UPDATE sessions SET expires_at = $2, last_seen_at = $3 WHERE id = $1', [id, nextExpiresAt, lastSeenAt]);
+      recordSessionRowUpdate();
       effectiveExpiresAt = toIso(nextExpiresAt);
     }
 
