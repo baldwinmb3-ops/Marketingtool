@@ -225,6 +225,102 @@ function normalizeCalendarPublishIntent(raw) {
   return out;
 }
 
+function normalizeCatalogDeleteIntents(raw) {
+  const src = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {};
+  const rows = Array.isArray(src.delete_intents)
+    ? src.delete_intents
+    : Array.isArray(src.deleteIntents)
+      ? src.deleteIntents
+      : [];
+  const out = [];
+  const seen = new Set();
+  for (const entry of rows) {
+    const row = entry && typeof entry === 'object' && !Array.isArray(entry) ? entry : {};
+    const entityTypeRaw = String(row.entity_type || row.entityType || row.type || '').trim().toLowerCase();
+    const entityType = entityTypeRaw === 'item' || entityTypeRaw === 'brand'
+      ? 'brand'
+      : entityTypeRaw === 'ticket_line' || entityTypeRaw === 'ticket-line' || entityTypeRaw === 'line'
+        ? 'ticket_line'
+        : '';
+    const entityId = String(row.entity_id || row.entityId || row.id || '').trim();
+    if (!entityType || !entityId) continue;
+    const key = `${entityType}:${entityId}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push({
+      entityType,
+      entityId,
+      name: String(row.name || row.entity_name || row.entityName || '').trim().slice(0, 180),
+      deletedAt: String(row.deleted_at || row.deletedAt || '').trim(),
+      adminUserId: String(row.admin_user_id || row.adminUserId || '').trim(),
+      adminName: String(row.admin_name || row.adminName || '').trim().slice(0, 180),
+      adminDevice: String(row.admin_device || row.adminDevice || '').trim().slice(0, 120),
+      source: String(row.source || '').trim().slice(0, 120),
+    });
+  }
+  return out;
+}
+
+function catalogDeleteIntentBrandIds(publishIntent) {
+  return new Set(
+    normalizeCatalogDeleteIntents(publishIntent)
+      .filter((entry) => entry.entityType === 'brand')
+      .map((entry) => entry.entityId),
+  );
+}
+
+function catalogDeleteIntentTicketLineIds(publishIntent) {
+  return new Set(
+    normalizeCatalogDeleteIntents(publishIntent)
+      .filter((entry) => entry.entityType === 'ticket_line')
+      .map((entry) => entry.entityId),
+  );
+}
+
+function pruneDeletedBrandReferences(value, deletedBrandIds) {
+  if (!deletedBrandIds || !deletedBrandIds.size) return value;
+  if (Array.isArray(value)) {
+    return value
+      .map((entry) => pruneDeletedBrandReferences(entry, deletedBrandIds))
+      .filter((entry) => entry !== null && entry !== undefined);
+  }
+  if (!value || typeof value !== 'object') return value;
+  const brandId = String(value.brandId || value.brand_id || '').trim();
+  if (brandId && deletedBrandIds.has(brandId)) return null;
+  const out = {};
+  for (const [key, entryValue] of Object.entries(value)) {
+    if ((key === 'brandIds' || key === 'brand_ids') && Array.isArray(entryValue)) {
+      out[key] = entryValue.map((id) => String(id || '').trim()).filter((id) => id && !deletedBrandIds.has(id));
+      continue;
+    }
+    out[key] = pruneDeletedBrandReferences(entryValue, deletedBrandIds);
+  }
+  return out;
+}
+
+function applyCatalogDeleteIntentsToPayload(payload, publishIntent) {
+  const source = payload && typeof payload === 'object' ? deepClone(payload) : {};
+  const deletedBrandIds = catalogDeleteIntentBrandIds(publishIntent);
+  const deletedTicketLineIds = catalogDeleteIntentTicketLineIds(publishIntent);
+  if (!deletedBrandIds.size && !deletedTicketLineIds.size) return source;
+  const brands = Array.isArray(source.brands) ? source.brands : [];
+  const ticketLines = Array.isArray(source.ticketLines) ? source.ticketLines : [];
+  const resources = Array.isArray(source.resources) ? source.resources : [];
+  source.brands = brands.filter((row) => {
+    const id = String((row && row.id) || '').trim();
+    return !id || !deletedBrandIds.has(id);
+  });
+  source.ticketLines = ticketLines.filter((row) => {
+    const id = String((row && row.id) || '').trim();
+    const brandId = String((row && row.brandId) || '').trim();
+    return !(id && deletedTicketLineIds.has(id)) && !(brandId && deletedBrandIds.has(brandId));
+  });
+  source.resources = resources
+    .map((row) => pruneDeletedBrandReferences(row, deletedBrandIds))
+    .filter((row) => row && typeof row === 'object');
+  return source;
+}
+
 function buildBrandScheduleState(brand) {
   const row = brand && typeof brand === 'object' ? brand : {};
   const id = String(row.id || '').trim();
@@ -453,18 +549,22 @@ function assessIntentionalScheduleRemovals(impact, publishIntent) {
     return { allowed: true, unexplainedAffectedBrands: [], message: '' };
   }
   const intentByBrand = normalizeCalendarPublishIntent(publishIntent);
+  const deletedBrandIds = catalogDeleteIntentBrandIds(publishIntent);
   if (!intentByBrand.size) {
-    const unexplainedAffectedBrands = affectedBrands.map((brandImpact) =>
-      buildIntentMismatchBrandImpact(brandImpact, 'missing-brand-intent'),
-    );
+    const unexplainedAffectedBrands = affectedBrands
+      .filter((brandImpact) => !deletedBrandIds.has(String((brandImpact && brandImpact.id) || '').trim()))
+      .map((brandImpact) => buildIntentMismatchBrandImpact(brandImpact, 'missing-brand-intent'));
     return {
-      allowed: false,
+      allowed: unexplainedAffectedBrands.length === 0,
       unexplainedAffectedBrands,
-      message: buildIntentMismatchMessage(unexplainedAffectedBrands),
+      message: unexplainedAffectedBrands.length ? buildIntentMismatchMessage(unexplainedAffectedBrands) : '',
     };
   }
   const unexplainedAffectedBrands = [];
   for (const brandImpact of affectedBrands) {
+    if (deletedBrandIds.has(String((brandImpact && brandImpact.id) || '').trim())) {
+      continue;
+    }
     const intent = intentByBrand.get(String((brandImpact && brandImpact.id) || '').trim());
     if (!intent) {
       unexplainedAffectedBrands.push(buildIntentMismatchBrandImpact(brandImpact, 'missing-brand-intent'));
@@ -510,7 +610,10 @@ function assessIntentionalScheduleRemovals(impact, publishIntent) {
 
 function assessCatalogPublishSafety(options = {}) {
   const currentPublished = options.currentPublished && typeof options.currentPublished === 'object' ? options.currentPublished : null;
-  const incomingPayload = options.incomingPayload && typeof options.incomingPayload === 'object' ? options.incomingPayload : {};
+  const incomingPayload = applyCatalogDeleteIntentsToPayload(
+    options.incomingPayload && typeof options.incomingPayload === 'object' ? options.incomingPayload : {},
+    options.publishIntent,
+  );
   const currentPayload =
     currentPublished && currentPublished.payload && typeof currentPublished.payload === 'object'
       ? currentPublished.payload
@@ -850,6 +953,8 @@ module.exports = {
   normalizeScheduleDates,
   normalizeScheduleStatus,
   normalizeScheduleWeekly,
+  normalizeCatalogDeleteIntents,
+  applyCatalogDeleteIntentsToPayload,
   brandDerivedScheduledValue,
   buildCatalogScheduleSummary,
   buildScheduledMigrationSummary,

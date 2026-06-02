@@ -1340,6 +1340,274 @@ test('cloud save_and_sync allows intentional live dated-slot removal when publis
   }
 });
 
+test('cloud save_and_sync allows confirmed unscheduled item delete intent', async () => {
+  const harness = await setupHarness();
+  try {
+    await signIn(harness);
+    const initial = await latestPublishedSnapshot(harness);
+    const seededPayload = deepClone(initial.body.snapshot);
+    const medieval = ensureBrand(seededPayload, 'brand-medieval-times', { name: 'Medieval Times' });
+    medieval.showScheduleDates = {};
+    medieval.showScheduleStatus = {};
+    medieval.showScheduleWeekly = {};
+    medieval.bookingRequired = false;
+    medieval.showInCalendar = false;
+    ensureBrand(seededPayload, 'brand-carolina-opry', { name: 'Carolina Opry' });
+    seededPayload.ticketLines = Array.isArray(seededPayload.ticketLines) ? seededPayload.ticketLines : [];
+    seededPayload.ticketLines.push(
+      {
+        id: 'line-medieval-delete-adult',
+        brandId: 'brand-medieval-times',
+        ticketLabel: 'Adult',
+        qualifierText: '12+',
+        infoText: '',
+        retailPrice: 89.99,
+        cmaPrice: 74.5,
+        active: true,
+        sortOrder: 1,
+        preGift: false,
+        bogoEnabled: false,
+        bogoLimit: 2,
+        childFree: false,
+        createdAt: '2026-06-01T20:11:56.000Z',
+        updatedAt: '2026-06-01T20:11:56.000Z',
+      },
+      {
+        id: 'line-opry-keep-premium',
+        brandId: 'brand-carolina-opry',
+        ticketLabel: 'Premium',
+        qualifierText: '',
+        infoText: '',
+        retailPrice: 69,
+        cmaPrice: 55,
+        active: true,
+        sortOrder: 1,
+        preGift: false,
+        bogoEnabled: false,
+        bogoLimit: 2,
+        childFree: false,
+        createdAt: '2026-06-01T20:11:56.000Z',
+        updatedAt: '2026-06-01T20:11:56.000Z',
+      },
+    );
+    seededPayload.resources = Array.isArray(seededPayload.resources) ? seededPayload.resources : [];
+    seededPayload.resources.push(
+      {
+        id: 'resource-medieval-delete',
+        title: 'Medieval Flyer',
+        kind: 'pdf',
+        brandId: 'brand-medieval-times',
+        url: 'https://example.local/medieval.pdf',
+        active: true,
+        createdAt: '2026-06-01T20:11:56.000Z',
+        updatedAt: '2026-06-01T20:11:56.000Z',
+      },
+      {
+        id: 'resource-opry-keep',
+        title: 'Opry Flyer',
+        kind: 'pdf',
+        brandId: 'brand-carolina-opry',
+        url: 'https://example.local/opry.pdf',
+        active: true,
+        createdAt: '2026-06-01T20:11:56.000Z',
+        updatedAt: '2026-06-01T20:11:56.000Z',
+      },
+    );
+    await seedPublishedSnapshot(harness.db, seededPayload, 2);
+
+    const current = await latestPublishedSnapshot(harness);
+    const payload = deepClone(current.body.snapshot);
+    const deletedBrand = ensureBrand(payload, 'brand-medieval-times', { name: 'Medieval Times' });
+    payload.brands = payload.brands.filter((entry) => String((entry && entry.id) || '') !== 'brand-medieval-times');
+
+    const saveSend = await requestJson(harness, '/api/cloud', {
+      method: 'POST',
+      body: {
+        action: 'save_and_sync',
+        request_id: 'confirmed-unscheduled-item-delete',
+        payload,
+        publish_intent: {
+          delete_intents: [{
+            entity_type: 'brand',
+            entity_id: 'brand-medieval-times',
+            name: deletedBrand.name,
+            deleted_at: '2026-06-01T20:11:56.000Z',
+            admin_user_id: 'user-admin-1',
+            admin_device: 'test-device',
+          }],
+        },
+      },
+    });
+
+    assert.equal(saveSend.status, 200, `Confirmed unscheduled delete should publish: ${JSON.stringify(saveSend.body)}`);
+    assert.equal(saveSend.body.ok, true);
+
+    const afterPublished = await latestPublishedSnapshot(harness);
+    assert.equal(
+      (afterPublished.body.snapshot.brands || []).some((entry) => String((entry && entry.id) || '') === 'brand-medieval-times'),
+      false,
+      'Deleted unscheduled brand should be absent from published snapshot.',
+    );
+    assert.equal(
+      (afterPublished.body.snapshot.ticketLines || []).some((entry) => String((entry && entry.brandId) || '') === 'brand-medieval-times'),
+      false,
+      'Deleted unscheduled brand ticket lines should be absent from published snapshot.',
+    );
+    assert.equal(
+      (afterPublished.body.snapshot.resources || []).some((entry) => String((entry && entry.brandId) || '') === 'brand-medieval-times'),
+      false,
+      'Deleted unscheduled brand resources should be absent from published snapshot.',
+    );
+    assert.equal(
+      (afterPublished.body.snapshot.brands || []).some((entry) => String((entry && entry.id) || '') === 'brand-carolina-opry'),
+      true,
+      'Unrelated brands must remain published.',
+    );
+    assert.equal(
+      (afterPublished.body.snapshot.ticketLines || []).some((entry) => String((entry && entry.id) || '') === 'line-opry-keep-premium'),
+      true,
+      'Unrelated ticket lines must remain published.',
+    );
+    assert.equal(
+      (afterPublished.body.snapshot.resources || []).some((entry) => String((entry && entry.id) || '') === 'resource-opry-keep'),
+      true,
+      'Unrelated resources must remain published.',
+    );
+  } finally {
+    await teardownHarness(harness);
+  }
+});
+
+test('cloud save_and_sync allows confirmed scheduled item delete intent and cascades schedule data', async () => {
+  const harness = await setupHarness();
+  try {
+    await signIn(harness);
+    const initial = await latestPublishedSnapshot(harness);
+    const scheduledPayload = buildScheduledCatalogPayload(initial.body.snapshot);
+    const medievalSeed = ensureBrand(scheduledPayload, 'brand-medieval-times', { name: 'Medieval Times' });
+    medievalSeed.showScheduleWeekly = { '1': ['7:00 PM'] };
+    medievalSeed.bookingRequired = true;
+    medievalSeed.showInCalendar = true;
+    scheduledPayload.ticketLines = Array.isArray(scheduledPayload.ticketLines) ? scheduledPayload.ticketLines : [];
+    scheduledPayload.ticketLines.push(
+      {
+        id: 'line-medieval-scheduled-delete-adult',
+        brandId: 'brand-medieval-times',
+        ticketLabel: 'Adult',
+        qualifierText: '12+',
+        infoText: '',
+        retailPrice: 89.99,
+        cmaPrice: 74.5,
+        active: true,
+        sortOrder: 1,
+        preGift: false,
+        bogoEnabled: false,
+        bogoLimit: 2,
+        childFree: false,
+        createdAt: '2026-06-01T20:11:56.000Z',
+        updatedAt: '2026-06-01T20:11:56.000Z',
+      },
+      {
+        id: 'line-opry-scheduled-keep-premium',
+        brandId: 'brand-carolina-opry',
+        ticketLabel: 'Premium',
+        qualifierText: '',
+        infoText: '',
+        retailPrice: 69,
+        cmaPrice: 55,
+        active: true,
+        sortOrder: 1,
+        preGift: false,
+        bogoEnabled: false,
+        bogoLimit: 2,
+        childFree: false,
+        createdAt: '2026-06-01T20:11:56.000Z',
+        updatedAt: '2026-06-01T20:11:56.000Z',
+      },
+    );
+    scheduledPayload.resources = Array.isArray(scheduledPayload.resources) ? scheduledPayload.resources : [];
+    scheduledPayload.resources.push(
+      {
+        id: 'resource-medieval-scheduled-delete',
+        title: 'Medieval Schedule',
+        kind: 'pdf',
+        brandId: 'brand-medieval-times',
+        url: 'https://example.local/medieval-schedule.pdf',
+        active: true,
+        createdAt: '2026-06-01T20:11:56.000Z',
+        updatedAt: '2026-06-01T20:11:56.000Z',
+      },
+      {
+        id: 'resource-opry-scheduled-keep',
+        title: 'Opry Schedule',
+        kind: 'pdf',
+        brandId: 'brand-carolina-opry',
+        url: 'https://example.local/opry-schedule.pdf',
+        active: true,
+        createdAt: '2026-06-01T20:11:56.000Z',
+        updatedAt: '2026-06-01T20:11:56.000Z',
+      },
+    );
+    await seedPublishedSnapshot(harness.db, scheduledPayload, 2);
+
+    const current = await latestPublishedSnapshot(harness);
+    const payload = deepClone(current.body.snapshot);
+    const deletedBrand = ensureBrand(payload, 'brand-medieval-times', { name: 'Medieval Times' });
+    payload.brands = payload.brands.filter((entry) => String((entry && entry.id) || '') !== 'brand-medieval-times');
+
+    const saveSend = await requestJson(harness, '/api/cloud', {
+      method: 'POST',
+      body: {
+        action: 'save_and_sync',
+        request_id: 'confirmed-scheduled-item-delete',
+        payload,
+        publish_intent: {
+          delete_intents: [{
+            entity_type: 'brand',
+            entity_id: 'brand-medieval-times',
+            name: deletedBrand.name,
+            deleted_at: '2026-06-01T20:11:56.000Z',
+            admin_user_id: 'user-admin-1',
+            admin_name: 'Primary Admin',
+            admin_device: 'test-device',
+          }],
+        },
+      },
+    });
+
+    assert.equal(saveSend.status, 200, `Confirmed scheduled delete should publish: ${JSON.stringify(saveSend.body)}`);
+    assert.equal(saveSend.body.ok, true);
+
+    const afterPublished = await latestPublishedSnapshot(harness);
+    assert.equal(Number(afterPublished.body.metadata && afterPublished.body.metadata.version), 3);
+    assert.equal(
+      (afterPublished.body.snapshot.brands || []).some((entry) => String((entry && entry.id) || '') === 'brand-medieval-times'),
+      false,
+      'Deleted scheduled brand should be absent from published snapshot.',
+    );
+    assert.equal(
+      (afterPublished.body.snapshot.ticketLines || []).some((entry) => String((entry && entry.brandId) || '') === 'brand-medieval-times'),
+      false,
+      'Deleted scheduled brand ticket lines should be absent from published snapshot.',
+    );
+    assert.equal(
+      (afterPublished.body.snapshot.resources || []).some((entry) => String((entry && entry.brandId) || '') === 'brand-medieval-times'),
+      false,
+      'Deleted scheduled brand resources should be absent from published snapshot.',
+    );
+    const counts = buildCatalogScheduleSummary(afterPublished.body.snapshot).counts;
+    assert.equal(counts.totalScheduleSlots, 1, 'Only the other scheduled brand should retain dated schedule slots.');
+    assert.equal(counts.totalWeeklySlots, 0, 'Deleted scheduled brand weekly schedule data should be gone.');
+    assert.equal(
+      (afterPublished.body.snapshot.brands || []).some((entry) => String((entry && entry.id) || '') === 'brand-carolina-opry'),
+      true,
+      'Other scheduled brands must remain published.',
+    );
+  } finally {
+    await teardownHarness(harness);
+  }
+});
+
 test('cloud save_and_sync blocks publish_intent when it would clear every live show time for a brand', async () => {
   const harness = await setupHarness();
   try {

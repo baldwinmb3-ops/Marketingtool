@@ -54,6 +54,7 @@ const {
   SCHEDULED_MIGRATION_INVALID_CODE,
   SCHEDULED_MIGRATION_INVALID_MESSAGE,
   assessCatalogPublishSafety,
+  applyCatalogDeleteIntentsToPayload,
   buildCatalogScheduleSummary,
   buildRecoveryConfirmationToken,
   deriveScheduledMigrationPayload,
@@ -541,7 +542,7 @@ async function publishSaveAndSendSnapshot(pool, options = {}) {
   const requestId = normalizeCloudRequestId(options.requestId);
   const startedAt = String(options.startedAt || '').trim();
   const userOps = Array.isArray(options.userOps) ? options.userOps : [];
-  const payload = sanitizeCatalogPayload(options.payload);
+  const payload = sanitizeCatalogPayload(applyCatalogDeleteIntentsToPayload(options.payload, options.publishIntent));
   return withLockedWriteTransaction(pool, async (client) => {
     const currentPublished = await client.query(
       'SELECT version, payload FROM snapshot_published_current WHERE id = TRUE LIMIT 1 FOR UPDATE',
