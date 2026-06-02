@@ -1478,6 +1478,41 @@ test('cloud save_and_sync allows confirmed unscheduled item delete intent', asyn
   }
 });
 
+test('cloud catalog_get_live_version returns published metadata without payload and honors session auth', async () => {
+  const harness = await setupHarness();
+  try {
+    await signIn(harness);
+
+    const versionInfo = await requestJson(harness, '/api/cloud', {
+      method: 'POST',
+      body: { action: 'catalog_get_live_version', stage: 'published' },
+    });
+    assert.equal(versionInfo.status, 200, `catalog_get_live_version should succeed: ${JSON.stringify(versionInfo.body)}`);
+    assert.equal(versionInfo.body.ok, true);
+    assert.equal(versionInfo.body.row.stage, 'published');
+    assert.equal(Number(versionInfo.body.row.version || 0) > 0, true);
+    assert.equal(typeof versionInfo.body.row.published_at, 'string');
+    assert.equal(typeof versionInfo.body.row.updated_at, 'string');
+    assert.equal(Object.prototype.hasOwnProperty.call(versionInfo.body.row || {}, 'payload'), false);
+
+    const signOut = await requestJson(harness, '/api/auth/sign-out', {
+      method: 'POST',
+      body: {},
+    });
+    assert.equal(signOut.status, 200, `sign-out should succeed: ${JSON.stringify(signOut.body)}`);
+    assert.equal(signOut.body.ok, true);
+
+    const after = await requestJson(harness, '/api/cloud', {
+      method: 'POST',
+      body: { action: 'catalog_get_live_version', stage: 'published' },
+    });
+    assert.equal(after.status, 401);
+    assert.equal(after.body.ok, false);
+  } finally {
+    await teardownHarness(harness);
+  }
+});
+
 test('cloud save_and_sync allows confirmed scheduled item delete intent and cascades schedule data', async () => {
   const harness = await setupHarness();
   try {

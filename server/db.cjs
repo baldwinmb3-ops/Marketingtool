@@ -1150,6 +1150,23 @@ async function readDb(pool) {
   });
 }
 
+async function readPublishedSnapshotMetadata(pool) {
+  return runReadWithRetry(async () => {
+    const result = await pool.query(
+      'SELECT version, published_at, updated_at, published_by_user_id FROM snapshot_published_current WHERE id = TRUE LIMIT 1',
+    );
+    const row = result.rows[0] || null;
+    return row
+      ? {
+          version: Number.parseInt(String(row.version || '1'), 10) || 1,
+          publishedAt: toIso(row.published_at),
+          updatedAt: toIso(row.updated_at),
+          publishedByUserId: String(row.published_by_user_id || ''),
+        }
+      : null;
+  });
+}
+
 async function withDb(pool, task) {
   const prior = DB_QUEUE_BY_POOL.get(pool) || Promise.resolve();
   const run = prior.then(async () => {
@@ -1426,6 +1443,7 @@ module.exports = {
   seedDatabase,
   initDatabase,
   readDb,
+  readPublishedSnapshotMetadata,
   readSnapshotStage,
   readBookingRows,
   withDb,

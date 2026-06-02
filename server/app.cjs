@@ -20,6 +20,7 @@ const {
   createPoolFromEnv,
   initDatabase,
   readDb,
+  readPublishedSnapshotMetadata,
   readSnapshotStage,
   readBookingRows,
   withDb,
@@ -2353,6 +2354,24 @@ async function createApp(options = {}) {
           res.json({ ok: true, row: { stage: 'draft', payload: d.payload, updated_at: d.updatedAt, updated_by: d.updatedByUserId }, message: 'Cloud draft loaded.' });
           return;
         }
+      }
+      if (action === 'catalog_get_live_version') {
+        const published = await readPublishedSnapshotMetadata(db);
+        if (!published) {
+          res.status(200).json({ ok: false, message: 'No published cloud snapshot found.' });
+          return;
+        }
+        res.json({
+          ok: true,
+          row: {
+            stage: 'published',
+            version: published.version,
+            published_at: published.publishedAt,
+            updated_at: published.updatedAt,
+          },
+          message: 'Cloud catalog version loaded.',
+        });
+        return;
       }
       if (action === 'catalog_save_stage') {
         const permissions = req.auth.payload.permissions || {};
