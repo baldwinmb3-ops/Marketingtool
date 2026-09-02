@@ -686,10 +686,41 @@ async function selectUsers(client) {
   return result.rows.map(mapUserToState);
 }
 
+async function selectAllUsers(client) {
+  const result = await client.query('SELECT * FROM users ORDER BY created_at ASC');
+  return result.rows.map(mapUserToState);
+}
+
 async function listUsers(pool) {
   const client = await pool.connect();
   try {
     return await selectUsers(client);
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * Narrow user-management state for apply_user_operations authorization/validation.
+ * Loads users only — never catalog snapshots, bookings, booking events, or audit history.
+ */
+async function readUserManagementState(pool) {
+  const client = await pool.connect();
+  try {
+    const users = await selectAllUsers(client);
+    return {
+      meta: {
+        createdAt: users[0] ? users[0].createdAt : nowIso(),
+        updatedAt: nowIso(),
+        schemaVersion: 2,
+        source: 'user-management',
+      },
+      users,
+      snapshots: { published: null, history: [], draft: null },
+      bookings: [],
+      bookingEvents: [],
+      audit: [],
+    };
   } finally {
     client.release();
   }
@@ -1443,6 +1474,7 @@ module.exports = {
   seedDatabase,
   initDatabase,
   readDb,
+  readUserManagementState,
   readPublishedSnapshotMetadata,
   readSnapshotStage,
   readBookingRows,

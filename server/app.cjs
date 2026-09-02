@@ -9,6 +9,7 @@ const {
   normalizeRole,
   normalizeManagerTitle,
   normalizeStatus,
+  normalizeWwid,
   normalizeIdentifier,
   normalizeEmail,
   verifyPassword,
@@ -20,6 +21,7 @@ const {
   createPoolFromEnv,
   initDatabase,
   readDb,
+  readUserManagementState,
   readPublishedSnapshotMetadata,
   readSnapshotStage,
   readBookingRows,
@@ -543,6 +545,74 @@ async function applyUserOperationsWithDirectPersistence(client, userOps, actor) 
     queued: operations.length,
     readyCount: operations.filter((op) => op && op.op === 'create_user').length,
   };
+}
+
+async function findUserRowForOperation(client, op) {
+  const row = op && typeof op === 'object' ? op : {};
+  const meta = row.metadata && typeof row.metadata === 'object' && !Array.isArray(row.metadata) ? row.metadata : {};
+  const localUserId = String(meta.local_user_id ?? meta.localUserId ?? '').trim();
+  const wwid = normalizeWwid(row.wwid || '');
+  const previousWwid = normalizeWwid(meta.previous_wwid ?? meta.previousWwid ?? '');
+  if (!localUserId && !wwid && !previousWwid) return null;
+  const result = await client.query(
+    `SELECT *
+     FROM users
+     WHERE ($1 <> '' AND id = $1)
+        OR ($2 <> '' AND wwid = $2)
+        OR ($3 <> '' AND wwid = $3)
+     ORDER BY CASE
+       WHEN $1 <> '' AND id = $1 THEN 0
+       WHEN $2 <> '' AND wwid = $2 THEN 1
+       WHEN $3 <> '' AND wwid = $3 THEN 2
+       ELSE 3
+     END,
+     created_at ASC
+     LIMIT 1
+     FOR UPDATE`,
+    [localUserId, wwid, previousWwid],
+  );
+  return result.rows[0] || null;
+}
+
+/**
+ * Apply user ops without loading catalog/booking/audit app state.
+ * Loads only the target user row(s) and upserts + audit inserts.
+ */
+async function applyUserOperationsDirect(pool, userOps, actor) {
+  const ops = Array.isArray(userOps) ? userOps : [];
+  if (!ops.length) {
+    return { received: 0, applied: 0, wwids: [] };
+  }
+  const summary = {
+    received: ops.length,
+    applied: ops.length,
+    wwids: ops.map((op) => op.wwid),
+  };
+  await withLockedWriteTransaction(pool, async (client) => {
+    for (const op of ops) {
+      const existingRow = await findUserRowForOperation(client, op);
+      const state = {
+        users: existingRow ? [mapUserToState(existingRow)] : [],
+        audit: [],
+      };
+      applyUserOperation(state, op, actor, logAudit);
+      if (state.users.length) {
+        await upsertUserRow(client, state.users[0]);
+      }
+      for (const entry of Array.isArray(state.audit) ? state.audit : []) {
+        await insertAuditLogRow(client, entry);
+      }
+    }
+    await insertAuditLogRow(client, {
+      action: 'user.apply_operations',
+      actorUserId: actor.userId,
+      actorName: actor.name,
+      targetType: 'user',
+      targetId: summary.wwids.join(','),
+      details: { operations: summary.applied },
+    });
+  });
+  return summary;
 }
 
 async function runQueuedSaveAndSendUserOperations(pool, options = {}) {
@@ -3353,49 +3423,36 @@ async function createApp(options = {}) {
         return;
       }
       if (action === 'apply_user_operations') {
-        const result = await withDb(db, async (db) => {
-          const permissions = requestPermissions(req);
-          const activeRole = requestActiveRole(req);
-          const canAdmin = activeRole === 'admin' ? !!permissions.manage_admin_updates : false;
-          const canManager = activeRole === 'manager' ? !!permissions.manage_marketer_users : !!permissions.manage_marketer_users && !permissions.manage_admin_updates;
-          if (!canAdmin && !canManager) {
-            return { status: 403, body: { ok: false, message: 'Only admins and managers can sync user login state.' } };
+        // Avoid full withDb() (catalog/bookings/audit rewrite). Auth uses request
+        // context; persistence loads only the target user row(s).
+        const permissions = requestPermissions(req);
+        const activeRole = requestActiveRole(req);
+        const canAdmin = activeRole === 'admin' ? !!permissions.manage_admin_updates : false;
+        const canManager = activeRole === 'manager' ? !!permissions.manage_marketer_users : !!permissions.manage_marketer_users && !permissions.manage_admin_updates;
+        if (!canAdmin && !canManager) {
+          res.status(403).json({ ok: false, message: 'Only admins and managers can sync user login state.' });
+          return;
+        }
+        let userOps = normalizeUserOperations(body.user_operations || body.operations);
+        if (!userOps.length) {
+          res.status(200).json({ ok: true, message: 'No user operations were supplied.', user_operations: { received: 0, applied: 0 } });
+          return;
+        }
+        if (canManager && !canAdmin) {
+          const restrictionMessage = managerUserOperationRestrictionMessage(userOps, req.auth.user && req.auth.user.departmentIds, req.auth.user);
+          if (restrictionMessage) {
+            res.status(403).json({ ok: false, message: restrictionMessage });
+            return;
           }
-          let userOps = normalizeUserOperations(body.user_operations || body.operations);
-          if (!userOps.length) {
-            return { status: 200, body: { ok: true, message: 'No user operations were supplied.', user_operations: { received: 0, applied: 0 } } };
-          }
-          if (canManager && !canAdmin) {
-            const restrictionMessage = managerUserOperationRestrictionMessage(userOps, req.auth.user && req.auth.user.departmentIds, req.auth.user);
-            if (restrictionMessage) {
-              return { status: 403, body: { ok: false, message: restrictionMessage } };
-            }
-            userOps = normalizeManagerScopedUserOperations(userOps, req.auth.user);
-          }
-          const actor = { userId: req.auth.user.id, name: req.auth.user.displayName };
-          userOps.forEach((op) => applyUserOperation(db, op, actor, logAudit));
-          logAudit(db, {
-            action: 'user.apply_operations',
-            actorUserId: req.auth.user.id,
-            actorName: req.auth.user.displayName,
-            targetType: 'user',
-            targetId: userOps.map((op) => op.wwid).join(','),
-            details: { operations: userOps.length },
-          });
-          return {
-            status: 200,
-            body: {
-              ok: true,
-              message: `Applied ${userOps.length} user operation${userOps.length === 1 ? '' : 's'}.`,
-              user_operations: {
-                received: userOps.length,
-                applied: userOps.length,
-                wwids: userOps.map((op) => op.wwid),
-              },
-            },
-          };
+          userOps = normalizeManagerScopedUserOperations(userOps, req.auth.user);
+        }
+        const actor = { userId: req.auth.user.id, name: req.auth.user.displayName };
+        const summary = await applyUserOperationsDirect(db, userOps, actor);
+        res.status(200).json({
+          ok: true,
+          message: `Applied ${summary.applied} user operation${summary.applied === 1 ? '' : 's'}.`,
+          user_operations: summary,
         });
-        res.status(result.status || 200).json(result.body || { ok: false, message: 'Cloud user sync failed.' });
         return;
       }
       res.status(400).json({ ok: false, message: `Unsupported action "${actionRaw || 'unknown'}".` });
